@@ -13,6 +13,7 @@
 #   Exemple: ollama pull llama3.2
 
 import os
+import json
 import re
 from io import BytesIO
 from typing import List, Tuple
@@ -98,14 +99,13 @@ def ollama_chat_stream(model: str, host: str, messages: List[dict]):
         for line in r.iter_lines(decode_unicode=True):
             if not line:
                 continue
-            data = None
-            try:
-                data = requests.models.complexjson.loads(line)  # type: ignore[attr-defined]
-            except Exception:
-                # fallback json
-                import json
 
-                data = json.loads(line)
+            # Some proxies prepend SSE-style "data:"; strip it if present.
+            payload_line = line[5:].strip() if line.startswith("data:") else line
+            try:
+                data = json.loads(payload_line)
+            except json.JSONDecodeError:
+                continue
 
             # Ollama envoie souvent {"message": {"content": "..."} , ...}
             if "message" in data and data["message"] and "content" in data["message"]:
