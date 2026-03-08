@@ -12,6 +12,7 @@
 #   Ollama lancé en local (par défaut http://localhost:11434)
 #   Exemple: ollama pull llama3.2
 
+import os
 import re
 from io import BytesIO
 from typing import List, Tuple
@@ -38,6 +39,11 @@ def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
 # Chunking simple
 # ----------------------------
 def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
+    if max_chars <= 0:
+        raise ValueError("max_chars must be > 0")
+    # Prevent non-progressing windows when overlap is too large.
+    overlap = max(0, min(overlap, max_chars - 1))
+
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
@@ -139,14 +145,21 @@ def build_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[
 st.set_page_config(page_title="PDF → Ollama (RAG local)", layout="wide")
 st.title("PDF → Q&A avec Ollama (local)")
 
+default_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
 with st.sidebar:
     st.header("Paramètres")
-    host = st.text_input("Ollama host", value="https://ollama.example.com")
+    host = st.text_input("Ollama host", value=default_ollama_host)
     model = st.text_input("Modèle Ollama", value="gpt-oss")
     k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=4)
     max_chars = st.slider("Taille chunk (chars)", min_value=600, max_value=4000, value=1800, step=100)
     overlap = st.slider("Overlap (chars)", min_value=0, max_value=800, value=200, step=50)
     show_context = st.checkbox("Afficher le contexte injecté", value=False)
+
+if overlap >= max_chars:
+    st.sidebar.warning(
+        "Overlap doit être inférieur à la taille de chunk. La valeur sera automatiquement réduite."
+    )
 
 uploaded_files = st.file_uploader("Upload un ou plusieurs PDF", type=["pdf"], accept_multiple_files=True)
 
