@@ -12,6 +12,7 @@
 #   Ollama lancé en local (par défaut http://localhost:11434)
 #   Exemple: ollama pull llama3.2
 
+import os
 import re
 from io import BytesIO
 from typing import List, Tuple
@@ -38,6 +39,11 @@ def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
 # Chunking simple
 # ----------------------------
 def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
+    if max_chars <= 0:
+        raise ValueError("max_chars must be > 0")
+    # Prevent non-progressing windows when overlap is too large.
+    overlap = max(0, min(overlap, max_chars - 1))
+
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
@@ -72,10 +78,10 @@ def score_chunk(query: str, chunk: str) -> int:
     return hits + 2 * uniq
 
 
-def top_k_chunks(query: str, chunks: List[str], k: int = 4) -> List[Tuple[int, str]]:
-    scored = [(score_chunk(query, ch), ch) for ch in chunks]
+def top_k_chunks(query: str, chunks: List[dict], k: int = 4) -> List[Tuple[int, dict]]:
+    scored = [(score_chunk(query, item["text"]), item) for item in chunks]
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [(s, ch) for s, ch in scored[:k] if s > 0]
+    return [(s, item) for s, item in scored[:k] if s > 0]
 
 
 # ----------------------------
@@ -112,13 +118,25 @@ def ollama_chat_stream(model: str, host: str, messages: List[dict]):
                 break
 
 
-def build_context(question: str, chunks: List[str], k: int) -> Tuple[str, List[Tuple[int, str]]]:
+def build_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[Tuple[int, dict]]]:
     selected = top_k_chunks(question, chunks, k=k)
     if selected:
-        ctx = "\n\n".join([f"[CHUNK score={s}]\n{ch}" for s, ch in selected])
+        ctx = "\n\n".join(
+            [
+                f"[CHUNK score={s} doc={item['doc_name']} idx={item['chunk_id']}]\n{item['text']}"
+                for s, item in selected
+            ]
+        )
         return ctx, selected
     # fallback: on injecte le début
-    return "\n\n".join(chunks[:2]), []
+    fallback_items = chunks[:2]
+    fallback_ctx = "\n\n".join(
+        [
+            f"[CHUNK score=0 doc={item['doc_name']} idx={item['chunk_id']}]\n{item['text']}"
+            for item in fallback_items
+        ]
+    )
+    return fallback_ctx, []
 
 
 # ----------------------------
@@ -127,19 +145,28 @@ def build_context(question: str, chunks: List[str], k: int) -> Tuple[str, List[T
 st.set_page_config(page_title="PDF → Ollama (RAG local)", layout="wide")
 st.title("PDF → Q&A avec Ollama (local)")
 
+default_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
 with st.sidebar:
     st.header("Paramètres")
-    host = st.text_input("Ollama host", value="https://ollama.example.com")
+    host = st.text_input("Ollama host", value=default_ollama_host)
     model = st.text_input("Modèle Ollama", value="gpt-oss")
     k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=4)
     max_chars = st.slider("Taille chunk (chars)", min_value=600, max_value=4000, value=1800, step=100)
     overlap = st.slider("Overlap (chars)", min_value=0, max_value=800, value=200, step=50)
     show_context = st.checkbox("Afficher le contexte injecté", value=False)
 
-uploaded = st.file_uploader("Upload un PDF", type=["pdf"])
+if overlap >= max_chars:
+    st.sidebar.warning(
+        "Overlap doit être inférieur à la taille de chunk. La valeur sera automatiquement réduite."
+    )
+
+uploaded_files = st.file_uploader("Upload un ou plusieurs PDF", type=["pdf"], accept_multiple_files=True)
 
 if "pdf_text" not in st.session_state:
     st.session_state.pdf_text = ""
+if "documents" not in st.session_state:
+    st.session_state.documents = []
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
 if "chat" not in st.session_state:
@@ -149,22 +176,60 @@ colL, colR = st.columns([1, 1], gap="large")
 
 with colL:
     st.subheader("1) Document")
-    if uploaded is None:
-        st.info("Charge un PDF pour commencer.")
+    if not uploaded_files:
+        st.info("Charge un ou plusieurs PDF pour commencer.")
     else:
-        pdf_bytes = uploaded.read()
-        if st.button("Indexer le PDF", type="primary"):
+        st.caption(f"{len(uploaded_files)} fichier(s) sélectionné(s).")
+        if st.button("Indexer les PDF", type="primary"):
+            all_texts = []
+            all_chunks = []
+            docs = []
+
             with st.spinner("Extraction du texte…"):
-                text = pdf_bytes_to_text(pdf_bytes)
-            if not text.strip():
+                for file in uploaded_files:
+                    text = pdf_bytes_to_text(file.read())
+                    if not text.strip():
+                        continue
+
+                    doc_chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
+                    docs.append(
+                        {
+                            "name": file.name,
+                            "text_chars": len(text),
+                            "chunks": len(doc_chunks),
+                        }
+                    )
+                    all_texts.append(f"===== {file.name} =====\n{text}")
+
+                    for idx, ch in enumerate(doc_chunks, start=1):
+                        all_chunks.append(
+                            {
+                                "doc_name": file.name,
+                                "chunk_id": idx,
+                                "text": ch,
+                            }
+                        )
+
+            if not all_chunks:
                 st.error(
-                    "Texte vide. Probable PDF scanné (images) → il faut un OCR avant. "
-                    "Sinon, essaie un autre PDF."
+                    "Aucun texte exploitable trouvé. Probable PDF scanné (images) → il faut un OCR avant. "
+                    "Sinon, essaie d'autres PDF."
                 )
             else:
-                st.session_state.pdf_text = text
-                st.session_state.chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
-                st.success(f"OK. {len(st.session_state.chunks)} chunks générés.")
+                st.session_state.pdf_text = "\n\n".join(all_texts)
+                st.session_state.documents = docs
+                st.session_state.chunks = all_chunks
+                st.success(
+                    f"OK. {len(st.session_state.documents)} document(s) indexé(s), "
+                    f"{len(st.session_state.chunks)} chunks générés."
+                )
+
+        if st.session_state.documents:
+            with st.expander("Documents indexés", expanded=False):
+                for doc in st.session_state.documents:
+                    st.markdown(
+                        f"- **{doc['name']}** — {doc['chunks']} chunks, {doc['text_chars']} caractères"
+                    )
         if st.session_state.pdf_text:
             with st.expander("Aperçu texte extrait", expanded=False):
                 st.text_area("Texte", st.session_state.pdf_text[:8000], height=260)
@@ -172,14 +237,14 @@ with colL:
 with colR:
     st.subheader("2) Chat")
     if not st.session_state.chunks:
-        st.warning("Indexe d’abord le PDF (bouton « Indexer le PDF »).")
+        st.warning("Indexe d’abord les documents (bouton « Indexer les PDF »).")
     else:
         # afficher historique
         for m in st.session_state.chat:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-        question = st.chat_input("Pose une question sur ce PDF…")
+        question = st.chat_input("Pose une question sur ces documents…")
         if question:
             # push user msg
             st.session_state.chat.append({"role": "user", "content": question})
