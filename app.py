@@ -22,6 +22,7 @@ from typing import Any, Generator, List, Tuple
 
 import requests
 import streamlit as st
+import tiktoken
 from pypdf import PdfReader
 
 
@@ -285,6 +286,15 @@ def build_pageindex_chunks(
     if openai_base_url.strip():
         os.environ["OPENAI_BASE_URL"] = openai_base_url
 
+    # PageIndex relies on tiktoken.encoding_for_model(model). Some model names
+    # used in local runtimes (ex: gpt-oss) are unknown to tiktoken.
+    # Fallback to a tokenizer-compatible OpenAI model name to prevent KeyError.
+    pageindex_model = model
+    try:
+        tiktoken.encoding_for_model(pageindex_model)
+    except KeyError:
+        pageindex_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
     # Patch runtime client construction to inject API key/base URL when the
     # package exposes an `openai` module reference (legacy-compatible behavior).
     if pageindex_utils is not None and hasattr(pageindex_utils, "openai"):
@@ -309,7 +319,7 @@ def build_pageindex_chunks(
         pageindex_utils.openai.AsyncOpenAI = patched_async_openai
 
     opt = config(
-        model=model,
+        model=pageindex_model,
         toc_check_page_num=20,
         max_page_num_each_node=10,
         max_token_num_each_node=20000,
@@ -388,7 +398,7 @@ with st.sidebar:
     provider = st.selectbox("Provider", options=["Ollama", "OpenAI-compatible"], index=0)
     if provider == "Ollama":
         host = st.text_input("Ollama host", value=default_ollama_host)
-        model = st.text_input("Modèle", value="gpt-oss")
+        model = st.text_input("Modèle", value="gpt-oss", key="model_ollama")
         api_key = ""
         openai_base_url = ""
     else:
@@ -403,7 +413,11 @@ with st.sidebar:
             type="password",
             help="Clé API utilisée avec l'en-tête Bearer.",
         )
-        model = st.text_input("Modèle", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+        model = st.text_input(
+            "Modèle",
+            value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            key="model_openai",
+        )
         host = ""
     k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=4)
     max_chars = st.slider("Taille chunk (chars)", min_value=600, max_value=4000, value=1800, step=100)
