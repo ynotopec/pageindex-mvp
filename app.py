@@ -15,7 +15,7 @@
 import os
 import re
 from io import BytesIO
-from typing import List, Tuple
+from typing import Any, Generator, List, Tuple
 
 import requests
 import streamlit as st
@@ -87,7 +87,7 @@ def top_k_chunks(query: str, chunks: List[dict], k: int = 4) -> List[Tuple[int, 
 # ----------------------------
 # Ollama streaming
 # ----------------------------
-def ollama_chat_stream(model: str, host: str, messages: List[dict]):
+def ollama_chat_stream(model: str, host: str, messages: List[dict]) -> Generator[str, None, None]:
     """
     Yield incremental tokens from Ollama /api/chat streaming response.
     """
@@ -118,6 +118,55 @@ def ollama_chat_stream(model: str, host: str, messages: List[dict]):
                 break
 
 
+def openai_compatible_chat_stream(
+    model: str,
+    base_url: str,
+    api_key: str,
+    messages: List[dict],
+) -> Generator[str, None, None]:
+    """
+    Yield incremental tokens from OpenAI-compatible /v1/chat/completions streaming response.
+    """
+    if not api_key.strip():
+        raise ValueError("OPENAI API key manquante")
+
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    payload = {"model": model, "stream": True, "messages": messages}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    with requests.post(url, json=payload, headers=headers, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+
+            data_part = line[5:].strip()
+            if data_part == "[DONE]":
+                break
+
+            try:
+                data = requests.models.complexjson.loads(data_part)  # type: ignore[attr-defined]
+            except Exception:
+                import json
+
+                data = json.loads(data_part)
+
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            chunk = delta.get("content")
+            if chunk:
+                yield chunk
+
+
 def build_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[Tuple[int, dict]]]:
     selected = top_k_chunks(question, chunks, k=k)
     if selected:
@@ -139,6 +188,119 @@ def build_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[
     return fallback_ctx, []
 
 
+def load_pageindex_lib() -> Tuple[Any, Any, Any]:
+    """
+    Load the installed PageIndex library package and return:
+    - page_index_main function
+    - config factory
+    - pageindex.utils module
+    """
+    from pageindex import page_index_main  # type: ignore
+    from pageindex.utils import config  # type: ignore
+    import pageindex.utils as pageindex_utils  # type: ignore
+
+    return page_index_main, config, pageindex_utils
+
+
+def build_pageindex_chunks(
+    uploaded_files: List[Any],
+    model: str,
+    api_key: str,
+    openai_base_url: str,
+) -> Tuple[List[dict], List[dict], List[str]]:
+    try:
+        page_index_main, config, pageindex_utils = load_pageindex_lib()
+    except Exception as e:
+        raise RuntimeError(
+            "Impossible d'importer la librairie PageIndex (package `pageindex`). "
+            "Vérifie que `pageindex` est bien installé depuis requirements.txt."
+        ) from e
+
+    os.environ["CHATGPT_API_KEY"] = api_key
+    if openai_base_url.strip():
+        os.environ["OPENAI_BASE_URL"] = openai_base_url
+
+    # Patch runtime client construction to inject API key/base URL.
+    original_sync_openai = pageindex_utils.openai.OpenAI
+    original_async_openai = pageindex_utils.openai.AsyncOpenAI
+
+    def patched_sync_openai(*args, **kwargs):
+        if not kwargs.get("api_key"):
+            kwargs["api_key"] = api_key
+        if openai_base_url.strip() and not kwargs.get("base_url"):
+            kwargs["base_url"] = openai_base_url
+        return original_sync_openai(*args, **kwargs)
+
+    def patched_async_openai(*args, **kwargs):
+        if not kwargs.get("api_key"):
+            kwargs["api_key"] = api_key
+        if openai_base_url.strip() and not kwargs.get("base_url"):
+            kwargs["base_url"] = openai_base_url
+        return original_async_openai(*args, **kwargs)
+
+    pageindex_utils.openai.OpenAI = patched_sync_openai
+    pageindex_utils.openai.AsyncOpenAI = patched_async_openai
+
+    opt = config(
+        model=model,
+        toc_check_page_num=20,
+        max_page_num_each_node=10,
+        max_token_num_each_node=20000,
+        if_add_node_id="yes",
+        if_add_node_summary="yes",
+        if_add_doc_description="no",
+        if_add_node_text="yes",
+    )
+
+    docs = []
+    all_chunks = []
+    all_texts = []
+
+    for file in uploaded_files:
+        raw_pdf = file.read()
+        if not raw_pdf:
+            continue
+
+        result = page_index_main(BytesIO(raw_pdf), opt)
+        structure = result.get("structure", [])
+        node_chunks = []
+
+        def visit(nodes: List[dict]) -> None:
+            for node in nodes:
+                node_text = (node.get("text") or "").strip()
+                node_summary = (node.get("summary") or "").strip()
+                if node_text:
+                    node_chunks.append(node_text)
+                elif node_summary:
+                    node_chunks.append(node_summary)
+                children = node.get("nodes") or []
+                if children:
+                    visit(children)
+
+        visit(structure)
+
+        docs.append(
+            {
+                "name": file.name,
+                "text_chars": sum(len(c) for c in node_chunks),
+                "chunks": len(node_chunks),
+            }
+        )
+
+        all_texts.append(f"===== {file.name} =====\n" + "\n\n".join(node_chunks))
+
+        for idx, ch in enumerate(node_chunks, start=1):
+            all_chunks.append(
+                {
+                    "doc_name": file.name,
+                    "chunk_id": idx,
+                    "text": ch,
+                }
+            )
+
+    return docs, all_chunks, all_texts
+
+
 # ----------------------------
 # Streamlit UI
 # ----------------------------
@@ -149,8 +311,33 @@ default_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 with st.sidebar:
     st.header("Paramètres")
-    host = st.text_input("Ollama host", value=default_ollama_host)
-    model = st.text_input("Modèle Ollama", value="gpt-oss")
+    indexing_backend = st.selectbox(
+        "Indexation",
+        options=["Chunking lexical (rapide)", "PageIndex package (structure + raisonnement)"],
+        index=0,
+    )
+    if indexing_backend.startswith("PageIndex"):
+        st.info("Librairie utilisée: `pageindex` (package Python installé).")
+    provider = st.selectbox("Provider", options=["Ollama", "OpenAI-compatible"], index=0)
+    if provider == "Ollama":
+        host = st.text_input("Ollama host", value=default_ollama_host)
+        model = st.text_input("Modèle", value="gpt-oss")
+        api_key = ""
+        openai_base_url = ""
+    else:
+        openai_base_url = st.text_input(
+            "OpenAI base URL",
+            value=os.getenv("OPENAI_BASE_URL", "http://localhost:8000"),
+            help="Exemples: https://api.openai.com ou URL d'un serveur compatible OpenAI.",
+        )
+        api_key = st.text_input(
+            "OPENAI API key",
+            value=os.getenv("OPENAI_API_KEY", ""),
+            type="password",
+            help="Clé API utilisée avec l'en-tête Bearer.",
+        )
+        model = st.text_input("Modèle", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+        host = ""
     k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=4)
     max_chars = st.slider("Taille chunk (chars)", min_value=600, max_value=4000, value=1800, step=100)
     overlap = st.slider("Overlap (chars)", min_value=0, max_value=800, value=200, step=50)
@@ -186,28 +373,44 @@ with colL:
             docs = []
 
             with st.spinner("Extraction du texte…"):
-                for file in uploaded_files:
-                    text = pdf_bytes_to_text(file.read())
-                    if not text.strip():
-                        continue
+                if indexing_backend.startswith("Chunking"):
+                    for file in uploaded_files:
+                        text = pdf_bytes_to_text(file.read())
+                        if not text.strip():
+                            continue
 
-                    doc_chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
-                    docs.append(
-                        {
-                            "name": file.name,
-                            "text_chars": len(text),
-                            "chunks": len(doc_chunks),
-                        }
-                    )
-                    all_texts.append(f"===== {file.name} =====\n{text}")
-
-                    for idx, ch in enumerate(doc_chunks, start=1):
-                        all_chunks.append(
+                        doc_chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
+                        docs.append(
                             {
-                                "doc_name": file.name,
-                                "chunk_id": idx,
-                                "text": ch,
+                                "name": file.name,
+                                "text_chars": len(text),
+                                "chunks": len(doc_chunks),
                             }
+                        )
+                        all_texts.append(f"===== {file.name} =====\n{text}")
+
+                        for idx, ch in enumerate(doc_chunks, start=1):
+                            all_chunks.append(
+                                {
+                                    "doc_name": file.name,
+                                    "chunk_id": idx,
+                                    "text": ch,
+                                }
+                            )
+                else:
+                    if provider != "OpenAI-compatible":
+                        st.error(
+                            "Le mode PageIndex package nécessite un endpoint OpenAI-compatible "
+                            "(provider = OpenAI-compatible)."
+                        )
+                    elif not api_key.strip():
+                        st.error("Le mode PageIndex package nécessite une OPENAI API key.")
+                    else:
+                        docs, all_chunks, all_texts = build_pageindex_chunks(
+                            uploaded_files=uploaded_files,
+                            model=model,
+                            api_key=api_key,
+                            openai_base_url=openai_base_url,
                         )
 
             if not all_chunks:
@@ -282,17 +485,36 @@ Réponds en français, de façon concise et factuelle. Appuie-toi uniquement sur
                 ]
 
                 try:
-                    for tok in ollama_chat_stream(model=model, host=host, messages=messages):
+                    if provider == "Ollama":
+                        stream = ollama_chat_stream(model=model, host=host, messages=messages)
+                    else:
+                        stream = openai_compatible_chat_stream(
+                            model=model,
+                            base_url=openai_base_url,
+                            api_key=api_key,
+                            messages=messages,
+                        )
+
+                    for tok in stream:
                         acc += tok
                         placeholder.markdown(acc)
                 except requests.exceptions.ConnectionError:
-                    st.error(
-                        "Impossible de joindre Ollama. Vérifie qu’Ollama tourne et que l’URL est bonne "
-                        f"({host})."
-                    )
+                    if provider == "Ollama":
+                        st.error(
+                            "Impossible de joindre Ollama. Vérifie qu’Ollama tourne et que l’URL est bonne "
+                            f"({host})."
+                        )
+                    else:
+                        st.error(
+                            "Impossible de joindre le endpoint OpenAI-compatible. Vérifie l'URL de base "
+                            f"({openai_base_url})."
+                        )
                     acc = ""
                 except requests.HTTPError as e:
-                    st.error(f"Erreur HTTP Ollama: {e}")
+                    st.error(f"Erreur HTTP provider ({provider}): {e}")
+                    acc = ""
+                except ValueError as e:
+                    st.error(str(e))
                     acc = ""
 
             if acc.strip():
@@ -311,4 +533,7 @@ Réponds en français, de façon concise et factuelle. Appuie-toi uniquement sur
                 st.session_state.chat = []
                 st.rerun()
         with c3:
-            st.caption("RAG lexical simple (sans embeddings).")
+            st.caption(
+                "Backends: chunking lexical rapide ou PageIndex package (structure), "
+                "avec chat Ollama/OpenAI API-like."
+            )
