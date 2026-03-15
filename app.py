@@ -273,6 +273,8 @@ def build_pageindex_chunks(
     model: str,
     api_key: str,
     openai_base_url: str,
+    lexical_max_chars: int,
+    lexical_overlap: int,
 ) -> Tuple[List[dict], List[dict], List[str]]:
     try:
         page_index_main, config, pageindex_utils = load_pageindex_lib()
@@ -338,23 +340,43 @@ def build_pageindex_chunks(
         if not raw_pdf:
             continue
 
-        result = page_index_main(BytesIO(raw_pdf), opt)
-        structure = result.get("structure", [])
         node_chunks = []
+        try:
+            result = page_index_main(BytesIO(raw_pdf), opt)
+            structure = result.get("structure", [])
 
-        def visit(nodes: List[dict]) -> None:
-            for node in nodes:
-                node_text = (node.get("text") or "").strip()
-                node_summary = (node.get("summary") or "").strip()
-                if node_text:
-                    node_chunks.append(node_text)
-                elif node_summary:
-                    node_chunks.append(node_summary)
-                children = node.get("nodes") or []
-                if children:
-                    visit(children)
+            def visit(nodes: List[dict]) -> None:
+                for node in nodes:
+                    node_text = (node.get("text") or "").strip()
+                    node_summary = (node.get("summary") or "").strip()
+                    if node_text:
+                        node_chunks.append(node_text)
+                    elif node_summary:
+                        node_chunks.append(node_summary)
+                    children = node.get("nodes") or []
+                    if children:
+                        visit(children)
 
-        visit(structure)
+            visit(structure)
+        except Exception as e:
+            # Guard against brittle upstream parser failures (ex: KeyError on toc_detected)
+            # and keep the app usable by falling back to lexical chunking for this document.
+            fallback_text = pdf_bytes_to_text(raw_pdf)
+            node_chunks = chunk_text(
+                fallback_text,
+                max_chars=lexical_max_chars,
+                overlap=lexical_overlap,
+            )
+            if node_chunks:
+                st.warning(
+                    f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
+                    "Fallback automatique vers chunking lexical."
+                )
+            else:
+                st.warning(
+                    f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}) "
+                    "et le fallback lexical n'a extrait aucun texte."
+                )
 
         docs.append(
             {
@@ -492,6 +514,8 @@ with colL:
                             model=model,
                             api_key=api_key,
                             openai_base_url=openai_base_url,
+                            lexical_max_chars=max_chars,
+                            lexical_overlap=overlap,
                         )
 
             if not all_chunks:
