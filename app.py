@@ -7,7 +7,7 @@ import streamlit as st
 
 from llm_streams import ollama_chat_stream, openai_compatible_chat_stream
 from pageindex_adapter import build_pageindex_chunks
-from rag_core import build_context, chunk_text, pdf_bytes_to_text
+from rag_core import build_context
 
 
 st.set_page_config(page_title="PDF → Ollama/OpenAI (RAG local)", layout="wide")
@@ -17,13 +17,7 @@ default_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 with st.sidebar:
     st.header("Paramètres")
-    indexing_backend = st.selectbox(
-        "Indexation",
-        options=["Chunking lexical (rapide)", "PageIndex package (structure + raisonnement)"],
-        index=0,
-    )
-    if indexing_backend.startswith("PageIndex"):
-        st.info("Librairie utilisée: `pageindex` (package Python installé).")
+    st.info("Indexation principale: `pageindex` (package Python installé).")
 
     provider = st.selectbox("Provider", options=["Ollama", "OpenAI-compatible"], index=0)
     if provider == "Ollama":
@@ -34,21 +28,26 @@ with st.sidebar:
     else:
         openai_base_url = st.text_input(
             "OpenAI base URL",
-            value=os.getenv("OPENAI_BASE_URL", "http://localhost:8000"),
+            value=os.getenv("OPENAI_API_BASE", os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")),
             help="Exemples: https://api.openai.com ou URL d'un serveur compatible OpenAI.",
         )
         api_key = st.text_input(
             "OPENAI API key",
-            value=os.getenv("OPENAI_API_KEY", ""),
+            value=os.getenv("OPENAI_API_KEY", os.getenv("CHATGPT_API_KEY", "")),
             type="password",
             help="Clé API utilisée avec l'en-tête Bearer.",
         )
-        model = st.text_input("Modèle", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), key="model_openai")
+        model = st.text_input(
+            "Modèle",
+            value=os.getenv("OPENAI_API_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+            key="model_openai",
+        )
         host = ""
 
     k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=4)
     max_chars = st.slider("Taille chunk (chars)", min_value=600, max_value=4000, value=1800, step=100)
     overlap = st.slider("Overlap (chars)", min_value=0, max_value=800, value=200, step=50)
+    allow_lexical_fallback = st.checkbox("Fallback lexical si PageIndex échoue", value=True)
     show_context = st.checkbox("Afficher le contexte injecté", value=False)
 
 if overlap >= max_chars:
@@ -79,39 +78,28 @@ with colL:
             docs = []
 
             with st.spinner("Extraction du texte…"):
-                if indexing_backend.startswith("Chunking"):
-                    for file in uploaded_files:
-                        text = pdf_bytes_to_text(file.read())
-                        if not text.strip():
-                            continue
-
-                        doc_chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
-                        docs.append({"name": file.name, "text_chars": len(text), "chunks": len(doc_chunks)})
-                        all_texts.append(f"===== {file.name} =====\n{text}")
-                        for idx, ch in enumerate(doc_chunks, start=1):
-                            all_chunks.append({"doc_name": file.name, "chunk_id": idx, "text": ch})
+                if provider != "OpenAI-compatible":
+                    st.error(
+                        "Le mode PageIndex nécessite un endpoint OpenAI-compatible "
+                        "(provider = OpenAI-compatible)."
+                    )
+                elif not api_key.strip():
+                    st.error("Le mode PageIndex nécessite une OPENAI API key.")
                 else:
-                    if provider != "OpenAI-compatible":
-                        st.error(
-                            "Le mode PageIndex package nécessite un endpoint OpenAI-compatible "
-                            "(provider = OpenAI-compatible)."
+                    try:
+                        docs, all_chunks, all_texts, warnings = build_pageindex_chunks(
+                            uploaded_files=uploaded_files,
+                            model=model,
+                            api_key=api_key,
+                            openai_base_url=openai_base_url,
+                            lexical_max_chars=max_chars,
+                            lexical_overlap=overlap,
+                            allow_lexical_fallback=allow_lexical_fallback,
                         )
-                    elif not api_key.strip():
-                        st.error("Le mode PageIndex package nécessite une OPENAI API key.")
-                    else:
-                        try:
-                            docs, all_chunks, all_texts, warnings = build_pageindex_chunks(
-                                uploaded_files=uploaded_files,
-                                model=model,
-                                api_key=api_key,
-                                openai_base_url=openai_base_url,
-                                lexical_max_chars=max_chars,
-                                lexical_overlap=overlap,
-                            )
-                            for w in warnings:
-                                st.warning(w)
-                        except Exception as e:
-                            st.error(f"Erreur PageIndex: {type(e).__name__}: {e}")
+                        for w in warnings:
+                            st.warning(w)
+                    except Exception as e:
+                        st.error(f"Erreur PageIndex: {type(e).__name__}: {e}")
 
             if not all_chunks:
                 st.error(
@@ -217,4 +205,4 @@ Réponds en français, de façon concise et factuelle. Appuie-toi uniquement sur
                 st.session_state.chat = []
                 st.rerun()
         with c3:
-            st.caption("Backends: chunking lexical rapide ou PageIndex package (structure), avec chat Ollama/OpenAI API-like.")
+            st.caption("Indexation: PageIndex (fallback lexical optionnel), chat Ollama/OpenAI API-like.")

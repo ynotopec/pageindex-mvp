@@ -73,7 +73,11 @@ def _safe_pageindex_model(model: str) -> str:
         tiktoken.encoding_for_model(model)
         return model
     except KeyError:
-        return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        return (
+            os.getenv("OPENAI_API_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or "gpt-4o-mini"
+        )
 
 
 def _patch_pageindex_openai(pageindex_utils: Any, api_key: str, openai_base_url: str) -> None:
@@ -108,12 +112,16 @@ def build_pageindex_chunks(
     openai_base_url: str,
     lexical_max_chars: int,
     lexical_overlap: int,
+    allow_lexical_fallback: bool = True,
 ) -> Tuple[List[dict], List[dict], List[str], List[str]]:
     page_index_main, config, pageindex_utils = load_pageindex_lib()
 
+    os.environ["OPENAI_API_MODEL"] = model
     os.environ["CHATGPT_API_KEY"] = api_key
+    os.environ["OPENAI_API_KEY"] = api_key
     if openai_base_url.strip():
         os.environ["OPENAI_BASE_URL"] = openai_base_url
+        os.environ["OPENAI_API_BASE"] = openai_base_url
 
     _patch_pageindex_openai(pageindex_utils, api_key=api_key, openai_base_url=openai_base_url)
 
@@ -157,17 +165,63 @@ def build_pageindex_chunks(
 
             visit(structure)
         except Exception as e:
-            fallback_text = pdf_bytes_to_text(raw_pdf)
-            node_chunks = chunk_text(fallback_text, max_chars=lexical_max_chars, overlap=lexical_overlap)
-            if node_chunks:
-                warnings.append(
-                    f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
-                    "Fallback automatique vers chunking lexical."
+            # Retry once with a known robust model for strict JSON outputs.
+            retry_model = os.getenv("OPENAI_API_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+            if retry_model != opt.model:
+                retry_opt = config(
+                    model=retry_model,
+                    toc_check_page_num=20,
+                    max_page_num_each_node=10,
+                    max_token_num_each_node=20000,
+                    if_add_node_id="yes",
+                    if_add_node_summary="yes",
+                    if_add_doc_description="no",
+                    if_add_node_text="yes",
                 )
+                try:
+                    retry_result = page_index_main(BytesIO(raw_pdf), retry_opt)
+                    retry_structure = retry_result.get("structure", [])
+
+                    def visit_retry(nodes: List[dict]) -> None:
+                        for node in nodes:
+                            node_text = (node.get("text") or "").strip()
+                            node_summary = (node.get("summary") or "").strip()
+                            if node_text:
+                                node_chunks.append(node_text)
+                            elif node_summary:
+                                node_chunks.append(node_summary)
+                            children = node.get("nodes") or []
+                            if children:
+                                visit_retry(children)
+
+                    visit_retry(retry_structure)
+                    warnings.append(
+                        f"PageIndex a échoué pour '{file.name}' avec '{opt.model}'. "
+                        f"Relance réussie avec '{retry_model}'."
+                    )
+                    e = None
+                except Exception as retry_err:
+                    e = retry_err
+
+            if node_chunks:
+                pass
+            elif allow_lexical_fallback:
+                fallback_text = pdf_bytes_to_text(raw_pdf)
+                node_chunks = chunk_text(fallback_text, max_chars=lexical_max_chars, overlap=lexical_overlap)
+                if node_chunks:
+                    warnings.append(
+                        f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
+                        "Fallback automatique vers chunking lexical."
+                    )
+                else:
+                    warnings.append(
+                        f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}) "
+                        "et le fallback lexical n'a extrait aucun texte."
+                    )
             else:
                 warnings.append(
-                    f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}) "
-                    "et le fallback lexical n'a extrait aucun texte."
+                    f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
+                    "Fallback lexical désactivé: document ignoré."
                 )
 
         docs.append({"name": file.name, "text_chars": sum(len(c) for c in node_chunks), "chunks": len(node_chunks)})

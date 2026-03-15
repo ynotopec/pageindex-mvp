@@ -4,6 +4,13 @@ from typing import Generator, List
 import requests
 
 
+def _openai_chat_url(base_url: str) -> str:
+    clean = base_url.rstrip("/")
+    if clean.endswith("/v1"):
+        return f"{clean}/chat/completions"
+    return f"{clean}/v1/chat/completions"
+
+
 def ollama_chat_stream(model: str, host: str, messages: List[dict]) -> Generator[str, None, None]:
     url = f"{host.rstrip('/')}/api/chat"
     payload = {"model": model, "stream": True, "messages": messages}
@@ -35,7 +42,7 @@ def openai_compatible_chat_stream(
     if not api_key.strip():
         raise ValueError("OPENAI API key manquante")
 
-    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    url = _openai_chat_url(base_url)
     payload = {"model": model, "stream": True, "messages": messages}
     headers = {
         "Authorization": f"Bearer {api_key}",
