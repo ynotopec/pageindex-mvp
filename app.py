@@ -14,7 +14,9 @@
 
 import os
 import re
+import importlib
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any, Generator, List, Tuple
 
 import requests
@@ -195,11 +197,49 @@ def load_pageindex_lib() -> Tuple[Any, Any, Any]:
     - config factory
     - pageindex.utils module
     """
-    from pageindex import page_index_main  # type: ignore
-    from pageindex.utils import config  # type: ignore
-    import pageindex.utils as pageindex_utils  # type: ignore
+    # Prefer installed package. Some versions expose `page_index_main` at package root,
+    # others only in `pageindex.page_index`.
+    page_index_main = None
+    config_factory = None
+    pageindex_utils = None
 
-    return page_index_main, config, pageindex_utils
+    try:
+        pkg = importlib.import_module("pageindex")
+        page_index_main = getattr(pkg, "page_index_main", None)
+    except Exception:
+        pkg = None
+
+    if page_index_main is None:
+        try:
+            mod = importlib.import_module("pageindex.page_index")
+            page_index_main = getattr(mod, "page_index_main", None)
+        except Exception:
+            page_index_main = None
+
+    try:
+        pageindex_utils = importlib.import_module("pageindex.utils")
+        config_factory = getattr(pageindex_utils, "config", None)
+    except Exception:
+        pageindex_utils = None
+        config_factory = None
+
+    # Fallback for packages without exported `config`
+    if config_factory is None:
+        config_factory = SimpleNamespace
+
+    # Last-resort fallback to bundled legacy source.
+    if page_index_main is None:
+        old_dir = os.path.join(os.path.dirname(__file__), "old")
+        if old_dir not in os.sys.path:
+            os.sys.path.insert(0, old_dir)
+        legacy_pkg = importlib.import_module("pageindex")
+        page_index_main = getattr(legacy_pkg, "page_index_main")
+        if pageindex_utils is None:
+            pageindex_utils = importlib.import_module("pageindex.utils")
+        if getattr(pageindex_utils, "config", None) is not None:
+            config_factory = pageindex_utils.config
+
+    return page_index_main, config_factory, pageindex_utils
 
 
 def build_pageindex_chunks(
@@ -220,26 +260,28 @@ def build_pageindex_chunks(
     if openai_base_url.strip():
         os.environ["OPENAI_BASE_URL"] = openai_base_url
 
-    # Patch runtime client construction to inject API key/base URL.
-    original_sync_openai = pageindex_utils.openai.OpenAI
-    original_async_openai = pageindex_utils.openai.AsyncOpenAI
+    # Patch runtime client construction to inject API key/base URL when the
+    # package exposes an `openai` module reference (legacy-compatible behavior).
+    if pageindex_utils is not None and hasattr(pageindex_utils, "openai"):
+        original_sync_openai = pageindex_utils.openai.OpenAI
+        original_async_openai = pageindex_utils.openai.AsyncOpenAI
 
-    def patched_sync_openai(*args, **kwargs):
-        if not kwargs.get("api_key"):
-            kwargs["api_key"] = api_key
-        if openai_base_url.strip() and not kwargs.get("base_url"):
-            kwargs["base_url"] = openai_base_url
-        return original_sync_openai(*args, **kwargs)
+        def patched_sync_openai(*args, **kwargs):
+            if not kwargs.get("api_key"):
+                kwargs["api_key"] = api_key
+            if openai_base_url.strip() and not kwargs.get("base_url"):
+                kwargs["base_url"] = openai_base_url
+            return original_sync_openai(*args, **kwargs)
 
-    def patched_async_openai(*args, **kwargs):
-        if not kwargs.get("api_key"):
-            kwargs["api_key"] = api_key
-        if openai_base_url.strip() and not kwargs.get("base_url"):
-            kwargs["base_url"] = openai_base_url
-        return original_async_openai(*args, **kwargs)
+        def patched_async_openai(*args, **kwargs):
+            if not kwargs.get("api_key"):
+                kwargs["api_key"] = api_key
+            if openai_base_url.strip() and not kwargs.get("base_url"):
+                kwargs["base_url"] = openai_base_url
+            return original_async_openai(*args, **kwargs)
 
-    pageindex_utils.openai.OpenAI = patched_sync_openai
-    pageindex_utils.openai.AsyncOpenAI = patched_async_openai
+        pageindex_utils.openai.OpenAI = patched_sync_openai
+        pageindex_utils.openai.AsyncOpenAI = patched_async_openai
 
     opt = config(
         model=model,
