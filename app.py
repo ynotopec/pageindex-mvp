@@ -15,6 +15,7 @@
 import os
 import re
 import importlib
+import sys
 from io import BytesIO
 from types import SimpleNamespace
 from typing import Any, Generator, List, Tuple
@@ -228,16 +229,40 @@ def load_pageindex_lib() -> Tuple[Any, Any, Any]:
         config_factory = SimpleNamespace
 
     # Last-resort fallback to bundled legacy source.
+    # IMPORTANT: we cannot re-import "pageindex" here because it may already
+    # point to the installed package in sys.modules.
     if page_index_main is None:
-        old_dir = os.path.join(os.path.dirname(__file__), "old")
-        if old_dir not in os.sys.path:
-            os.sys.path.insert(0, old_dir)
-        legacy_pkg = importlib.import_module("pageindex")
-        page_index_main = getattr(legacy_pkg, "page_index_main")
-        if pageindex_utils is None:
-            pageindex_utils = importlib.import_module("pageindex.utils")
-        if getattr(pageindex_utils, "config", None) is not None:
+        old_root = os.path.join(os.path.dirname(__file__), "old")
+        if old_root not in sys.path:
+            sys.path.insert(0, old_root)
+
+        # Ensure we import legacy `pageindex` and not the already-cached installed one.
+        cached_pageindex_modules = {
+            name: module
+            for name, module in list(sys.modules.items())
+            if name == "pageindex" or name.startswith("pageindex.")
+        }
+        for name in cached_pageindex_modules:
+            sys.modules.pop(name, None)
+
+        try:
+            legacy_mod = importlib.import_module("pageindex.page_index")
+            page_index_main = getattr(legacy_mod, "page_index_main", None)
+            if pageindex_utils is None:
+                pageindex_utils = importlib.import_module("pageindex.utils")
+        finally:
+            # Restore previously cached package modules so rest of app behavior
+            # remains stable after fallback probing.
+            for name, module in cached_pageindex_modules.items():
+                sys.modules.setdefault(name, module)
+
+        if pageindex_utils is not None and getattr(pageindex_utils, "config", None) is not None:
             config_factory = pageindex_utils.config
+
+    if page_index_main is None:
+        raise ImportError(
+            "`page_index_main` introuvable dans le package `pageindex` installé et fallback legacy indisponible."
+        )
 
     return page_index_main, config_factory, pageindex_utils
 
