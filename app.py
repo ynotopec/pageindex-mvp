@@ -45,13 +45,7 @@ with st.sidebar:
         host = ""
 
     k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=4)
-    max_chars = st.slider("Taille chunk (chars)", min_value=600, max_value=4000, value=1800, step=100)
-    overlap = st.slider("Overlap (chars)", min_value=0, max_value=800, value=200, step=50)
-    allow_lexical_fallback = st.checkbox("Fallback lexical si PageIndex échoue", value=True)
     show_context = st.checkbox("Afficher le contexte injecté", value=False)
-
-if overlap >= max_chars:
-    st.sidebar.warning("Overlap doit être inférieur à la taille de chunk. La valeur sera automatiquement réduite.")
 
 uploaded_files = st.file_uploader("Upload un ou plusieurs PDF", type=["pdf"], accept_multiple_files=True)
 
@@ -92,9 +86,6 @@ with colL:
                             model=model,
                             api_key=api_key,
                             openai_base_url=openai_base_url,
-                            lexical_max_chars=max_chars,
-                            lexical_overlap=overlap,
-                            allow_lexical_fallback=allow_lexical_fallback,
                         )
                         for w in warnings:
                             st.warning(w)
@@ -205,4 +196,4 @@ Réponds en français, de façon concise et factuelle. Appuie-toi uniquement sur
                 st.session_state.chat = []
                 st.rerun()
         with c3:
-            st.caption("Indexation: PageIndex (fallback lexical optionnel), chat Ollama/OpenAI API-like.")
+            st.caption("Indexation: PageIndex uniquement, chat Ollama/OpenAI API-like.")

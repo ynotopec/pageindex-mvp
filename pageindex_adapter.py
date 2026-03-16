@@ -7,9 +7,6 @@ from typing import Any, List, Tuple
 
 import tiktoken
 
-from rag_core import chunk_text, pdf_bytes_to_text
-
-
 def load_pageindex_lib() -> Tuple[Any, Any, Any]:
     page_index_main = None
     config_factory = None
@@ -110,9 +107,6 @@ def build_pageindex_chunks(
     model: str,
     api_key: str,
     openai_base_url: str,
-    lexical_max_chars: int,
-    lexical_overlap: int,
-    allow_lexical_fallback: bool = True,
 ) -> Tuple[List[dict], List[dict], List[str], List[str]]:
     page_index_main, config, pageindex_utils = load_pageindex_lib()
 
@@ -203,26 +197,14 @@ def build_pageindex_chunks(
                 except Exception as retry_err:
                     e = retry_err
 
-            if node_chunks:
-                pass
-            elif allow_lexical_fallback:
-                fallback_text = pdf_bytes_to_text(raw_pdf)
-                node_chunks = chunk_text(fallback_text, max_chars=lexical_max_chars, overlap=lexical_overlap)
-                if node_chunks:
-                    warnings.append(
-                        f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
-                        "Fallback automatique vers chunking lexical."
-                    )
-                else:
-                    warnings.append(
-                        f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}) "
-                        "et le fallback lexical n'a extrait aucun texte."
-                    )
-            else:
+            if not node_chunks:
                 warnings.append(
                     f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
-                    "Fallback lexical désactivé: document ignoré."
+                    "Document ignoré (pas de fallback lexical)."
                 )
+
+        if not node_chunks:
+            continue
 
         docs.append({"name": file.name, "text_chars": sum(len(c) for c in node_chunks), "chunks": len(node_chunks)})
         all_texts.append(f"===== {file.name} =====\n" + "\n\n".join(node_chunks))
