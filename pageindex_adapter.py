@@ -72,6 +72,34 @@ def load_pageindex_lib() -> Tuple[Any, Any, Any]:
     return page_index_main, config_factory, pageindex_utils
 
 
+def load_legacy_pageindex_lib() -> Tuple[Any, Any, Any]:
+    old_root = os.path.join(os.path.dirname(__file__), "old")
+    if old_root not in sys.path:
+        sys.path.insert(0, old_root)
+
+    cached = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name == "pageindex" or name.startswith("pageindex.")
+    }
+    for name in cached:
+        sys.modules.pop(name, None)
+
+    try:
+        legacy_mod = importlib.import_module("pageindex.page_index")
+        page_index_main = getattr(legacy_mod, "page_index_main", None)
+        pageindex_utils = importlib.import_module("pageindex.utils")
+        config_factory = getattr(pageindex_utils, "config", SimpleNamespace)
+    finally:
+        for name, module in cached.items():
+            sys.modules.setdefault(name, module)
+
+    if page_index_main is None:
+        raise ImportError("`page_index_main` introuvable dans legacy pageindex (old/).")
+
+    return page_index_main, config_factory, pageindex_utils
+
+
 def _safe_pageindex_model(model: str) -> str:
     return model or os.getenv("OPENAI_API_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-oss"
 
@@ -182,6 +210,16 @@ def build_pageindex_chunks(
 ) -> Tuple[List[dict], List[dict], List[str], List[str]]:
     page_index_main, config, pageindex_utils = load_pageindex_lib()
 
+    # Optional runtime fallback to bundled legacy implementation when installed
+    # package is present but fails on specific documents (e.g. Processing failed).
+    legacy_page_index_main = None
+    legacy_config = None
+    legacy_utils = None
+    try:
+        legacy_page_index_main, legacy_config, legacy_utils = load_legacy_pageindex_lib()
+    except Exception:
+        legacy_page_index_main = None
+
     os.environ["OPENAI_API_MODEL"] = model
     os.environ["CHATGPT_API_KEY"] = api_key
     os.environ["OPENAI_API_KEY"] = api_key
@@ -193,6 +231,11 @@ def build_pageindex_chunks(
     _patch_pageindex_token_counter(pageindex_utils, page_index_main=page_index_main)
     _patch_pageindex_tokenizer_mapping(pageindex_utils, page_index_main=page_index_main)
 
+    if legacy_page_index_main is not None:
+        _patch_pageindex_openai(legacy_utils, api_key=api_key, openai_base_url=openai_base_url)
+        _patch_pageindex_token_counter(legacy_utils, page_index_main=legacy_page_index_main)
+        _patch_pageindex_tokenizer_mapping(legacy_utils, page_index_main=legacy_page_index_main)
+
     opt = config(
         model=_safe_pageindex_model(model),
         toc_check_page_num=20,
@@ -203,6 +246,19 @@ def build_pageindex_chunks(
         if_add_doc_description="no",
         if_add_node_text="yes",
     )
+
+    legacy_opt = None
+    if legacy_page_index_main is not None and legacy_config is not None:
+        legacy_opt = legacy_config(
+            model=_safe_pageindex_model(model),
+            toc_check_page_num=20,
+            max_page_num_each_node=10,
+            max_token_num_each_node=20000,
+            if_add_node_id="yes",
+            if_add_node_summary="yes",
+            if_add_doc_description="no",
+            if_add_node_text="yes",
+        )
 
     docs: List[dict] = []
     all_chunks: List[dict] = []
@@ -272,10 +328,41 @@ def build_pageindex_chunks(
                     e = retry_err
 
             if not node_chunks:
-                warnings.append(
-                    f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
-                    "Document ignoré (pas de fallback lexical)."
-                )
+                # Final fallback: retry same document with bundled legacy pageindex.
+                if legacy_page_index_main is not None and legacy_opt is not None:
+                    try:
+                        legacy_result = legacy_page_index_main(BytesIO(raw_pdf), legacy_opt)
+                        legacy_structure = legacy_result.get("structure", [])
+
+                        def visit_legacy(nodes: List[dict]) -> None:
+                            for node in nodes:
+                                node_text = (node.get("text") or "").strip()
+                                node_summary = (node.get("summary") or "").strip()
+                                if node_text:
+                                    node_chunks.append(node_text)
+                                elif node_summary:
+                                    node_chunks.append(node_summary)
+                                children = node.get("nodes") or []
+                                if children:
+                                    visit_legacy(children)
+
+                        visit_legacy(legacy_structure)
+                        if node_chunks:
+                            warnings.append(
+                                f"PageIndex installé a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
+                                "Fallback interne vers `old/pageindex` réussi."
+                            )
+                    except Exception as legacy_err:
+                        warnings.append(
+                            f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}); "
+                            f"fallback `old/pageindex` a aussi échoué ({type(legacy_err).__name__}: {legacy_err}). "
+                            "Document ignoré (pas de fallback lexical)."
+                        )
+                else:
+                    warnings.append(
+                        f"PageIndex a échoué pour '{file.name}' ({type(e).__name__}: {e}). "
+                        "Document ignoré (pas de fallback lexical)."
+                    )
 
         if not node_chunks:
             continue
