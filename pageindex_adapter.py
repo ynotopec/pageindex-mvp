@@ -93,12 +93,7 @@ def _patch_pageindex_openai(pageindex_utils: Any, api_key: str, openai_base_url:
     pageindex_utils.openai.AsyncOpenAI = patched_async_openai
 
 
-def _patch_pageindex_token_counter(pageindex_utils: Any) -> None:
-    if pageindex_utils is None or not hasattr(pageindex_utils, "count_tokens"):
-        return
-
-    original_count_tokens = pageindex_utils.count_tokens
-
+def _build_safe_count_tokens(original_count_tokens):
     def patched_count_tokens(text, model=None):
         try:
             return original_count_tokens(text, model=model)
@@ -109,7 +104,24 @@ def _patch_pageindex_token_counter(pageindex_utils: Any) -> None:
             # Approximation: ~4 chars/token for Latin text.
             return max(1, len(text) // 4)
 
+    return patched_count_tokens
+
+
+def _patch_pageindex_token_counter(pageindex_utils: Any, page_index_main: Any) -> None:
+    if pageindex_utils is None or not hasattr(pageindex_utils, "count_tokens"):
+        return
+
+    original_count_tokens = pageindex_utils.count_tokens
+    patched_count_tokens = _build_safe_count_tokens(original_count_tokens)
     pageindex_utils.count_tokens = patched_count_tokens
+
+    # `pageindex.page_index` imports `count_tokens` with `from .utils import *`.
+    # Replace its module-level reference too, otherwise KeyError can still occur.
+    try:
+        if hasattr(page_index_main, "__globals__") and "count_tokens" in page_index_main.__globals__:
+            page_index_main.__globals__["count_tokens"] = patched_count_tokens
+    except Exception:
+        pass
 
 
 def build_pageindex_chunks(
@@ -128,7 +140,7 @@ def build_pageindex_chunks(
         os.environ["OPENAI_API_BASE"] = openai_base_url
 
     _patch_pageindex_openai(pageindex_utils, api_key=api_key, openai_base_url=openai_base_url)
-    _patch_pageindex_token_counter(pageindex_utils)
+    _patch_pageindex_token_counter(pageindex_utils, page_index_main=page_index_main)
 
     opt = config(
         model=_safe_pageindex_model(model),
