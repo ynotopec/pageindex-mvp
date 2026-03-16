@@ -70,6 +70,7 @@ with colL:
             all_texts = []
             all_chunks = []
             docs = []
+            warnings = []
 
             with st.spinner("Extraction du texte…"):
                 if provider != "OpenAI-compatible":
@@ -93,10 +94,16 @@ with colL:
                         st.error(f"Erreur PageIndex: {type(e).__name__}: {e}")
 
             if not all_chunks:
-                st.error(
-                    "Aucun texte exploitable trouvé. Probable PDF scanné (images) → il faut un OCR avant. "
-                    "Sinon, essaie d'autres PDF."
-                )
+                if warnings:
+                    st.error(
+                        "PageIndex n'a extrait aucun chunk exploitable sur les documents fournis. "
+                        "Vérifie le modèle endpoint, le format PDF, ou essaie un autre modèle."
+                    )
+                else:
+                    st.error(
+                        "Aucun texte exploitable trouvé. Probable PDF scanné (images) → il faut un OCR avant. "
+                        "Sinon, essaie d'autres PDF."
+                    )
             else:
                 st.session_state.pdf_text = "\n\n".join(all_texts)
                 st.session_state.documents = docs

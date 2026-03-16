@@ -6,6 +6,14 @@ from types import SimpleNamespace
 from typing import Any, List, Tuple
 
 
+class _OfflineEncoding:
+    def encode(self, text: str):
+        if not text:
+            return []
+        # Deterministic offline approximation (~4 chars per token).
+        return list(range(max(1, len(text) // 4)))
+
+
 def load_pageindex_lib() -> Tuple[Any, Any, Any]:
     page_index_main = None
     config_factory = None
@@ -124,6 +132,48 @@ def _patch_pageindex_token_counter(pageindex_utils: Any, page_index_main: Any) -
         pass
 
 
+def _patch_pageindex_tokenizer_mapping(pageindex_utils: Any, page_index_main: Any) -> None:
+    """
+    Some PageIndex versions call tiktoken.encoding_for_model directly.
+    Patch that path to avoid KeyError with open-source model names.
+    """
+
+    def patch_module_tiktoken(module_like: Any) -> None:
+        if module_like is None or not hasattr(module_like, "tiktoken"):
+            return
+        tk = module_like.tiktoken
+        if not hasattr(tk, "encoding_for_model"):
+            return
+
+        original = tk.encoding_for_model
+
+        def safe_encoding_for_model(model_name):
+            try:
+                return original(model_name)
+            except Exception:
+                return _OfflineEncoding()
+
+        tk.encoding_for_model = safe_encoding_for_model
+
+    patch_module_tiktoken(pageindex_utils)
+
+    try:
+        if hasattr(page_index_main, "__globals__") and "tiktoken" in page_index_main.__globals__:
+            tk = page_index_main.__globals__["tiktoken"]
+            if hasattr(tk, "encoding_for_model"):
+                original = tk.encoding_for_model
+
+                def safe_encoding_for_model(model_name):
+                    try:
+                        return original(model_name)
+                    except Exception:
+                        return _OfflineEncoding()
+
+                tk.encoding_for_model = safe_encoding_for_model
+    except Exception:
+        pass
+
+
 def build_pageindex_chunks(
     uploaded_files: List[Any],
     model: str,
@@ -141,6 +191,7 @@ def build_pageindex_chunks(
 
     _patch_pageindex_openai(pageindex_utils, api_key=api_key, openai_base_url=openai_base_url)
     _patch_pageindex_token_counter(pageindex_utils, page_index_main=page_index_main)
+    _patch_pageindex_tokenizer_mapping(pageindex_utils, page_index_main=page_index_main)
 
     opt = config(
         model=_safe_pageindex_model(model),
