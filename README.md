@@ -56,7 +56,7 @@ Pour un serveur OpenAI-compatible local ou privé, modifie `OPENAI_BASE_URL`, pa
 
 `OPENAI_AGENTS_DISABLE_TRACING=1` est recommandé par défaut avec les serveurs locaux ou clés non-OpenAI : cela évite que l’OpenAI Agents SDK tente d’exporter des traces vers OpenAI et produise une erreur 401 non fatale.
 
-Si le stream retourne `Error streaming response: Internal Server Error`, l’app tente automatiquement un second appel PageIndex non-streaming et affiche un diagnostic sans exposer la clé API. Si ce retry échoue aussi, vérifie surtout `OPENAI_BASE_URL`, le token, et les préfixes provider LiteLLM des modèles.
+Si le stream retourne `Error streaming response: Internal Server Error`, l’app tente automatiquement un second appel PageIndex non-streaming hors de la boucle asyncio du stream et affiche un diagnostic sans exposer la clé API. Si ce retry échoue aussi, vérifie surtout `OPENAI_BASE_URL`, le token, et les préfixes provider LiteLLM des modèles.
 
 For PageIndex cloud mode:
 

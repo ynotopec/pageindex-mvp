@@ -1,4 +1,6 @@
 import ast
+import asyncio
+import inspect
 import os
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ HELPER_NAMES = {
     "sanitize_error_text",
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
+    "run_pageindex_query_non_stream",
 }
 
 
@@ -24,12 +27,14 @@ def load_helpers():
     selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in HELPER_NAMES]
     module = ast.Module(
         body=[
+            ast.Import(names=[ast.alias(name="asyncio")]),
             ast.Import(names=[ast.alias(name="hashlib")]),
+            ast.Import(names=[ast.alias(name="inspect")]),
             ast.Import(names=[ast.alias(name="json")]),
             ast.Import(names=[ast.alias(name="os")]),
             ast.Import(names=[ast.alias(name="re")]),
             ast.ImportFrom(module="pathlib", names=[ast.alias(name="Path")], level=0),
-            ast.ImportFrom(module="typing", names=[ast.alias(name="Any"), ast.alias(name="Dict"), ast.alias(name="Optional")], level=0),
+            ast.ImportFrom(module="typing", names=[ast.alias(name="Any"), ast.alias(name="Dict"), ast.alias(name="List"), ast.alias(name="Optional")], level=0),
             *selected,
         ],
         type_ignores=[],
@@ -143,6 +148,41 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertIn("OPENAI_BASE_URL", text)
         self.assertIn("Provider List", text)
+
+    def test_non_stream_query_helper_requires_no_running_loop(self):
+        helpers = load_helpers()
+
+        class FakeCollection:
+            def query(self, question, doc_ids=None, stream=False):
+                self.question = question
+                self.doc_ids = doc_ids
+                self.stream = stream
+                return {"answer": "Réponse non-stream"}
+
+        collection = FakeCollection()
+        answer = helpers["run_pageindex_query_non_stream"](
+            collection=collection,
+            question="Question ?",
+            doc_ids=["doc-1"],
+        )
+
+        self.assertEqual(answer, "Réponse non-stream")
+        self.assertEqual(collection.question, "Question ?")
+        self.assertEqual(collection.doc_ids, ["doc-1"])
+        self.assertFalse(collection.stream)
+
+    def test_non_stream_query_helper_rejects_running_event_loop(self):
+        helpers = load_helpers()
+
+        async def call_helper():
+            with self.assertRaisesRegex(RuntimeError, "hors de la boucle asyncio"):
+                helpers["run_pageindex_query_non_stream"](
+                    collection=object(),
+                    question="Question ?",
+                    doc_ids=[],
+                )
+
+        asyncio.run(call_helper())
 
 
 if __name__ == "__main__":

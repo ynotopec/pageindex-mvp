@@ -228,6 +228,21 @@ def index_with_pageindex(collection: Any, stored_path: Path) -> str:
     return str(collection.add(str(stored_path)))
 
 
+def run_pageindex_query_non_stream(*, collection: Any, question: str, doc_ids: List[str]) -> str:
+    """Run PageIndex non-streaming query from a context without an active event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        retry_result = collection.query(question, doc_ids=doc_ids or None, stream=False)
+        if inspect.isawaitable(retry_result):
+            retry_result = asyncio.run(retry_result)
+        return pageindex_query_result_to_text(retry_result)
+
+    raise RuntimeError(
+        "run_pageindex_query_non_stream doit être exécuté hors de la boucle asyncio active."
+    )
+
+
 def run_pageindex_query(
     *,
     collection: Any,
@@ -265,10 +280,12 @@ def run_pageindex_query(
         except Exception as stream_exc:
             on_trace({"type": "stream_error", "data": sanitize_error_text(stream_exc)})
             try:
-                retry_result = collection.query(question, doc_ids=doc_ids or None, stream=False)
-                if inspect.isawaitable(retry_result):
-                    retry_result = await retry_result
-                retry_answer = pageindex_query_result_to_text(retry_result)
+                retry_answer = await asyncio.to_thread(
+                    run_pageindex_query_non_stream,
+                    collection=collection,
+                    question=question,
+                    doc_ids=doc_ids,
+                )
                 if retry_answer:
                     on_trace({"type": "non_stream_retry", "data": "Réponse récupérée après échec du streaming."})
                     return retry_answer
