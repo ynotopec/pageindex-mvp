@@ -23,8 +23,16 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+# Disable OpenAI Agents trace export by default before PageIndex imports the
+# agents SDK. Local/OpenAI-compatible keys are often not valid OpenAI platform
+# keys, so exporting traces can otherwise create noisy 401 warnings.
+os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
+
+from agents import set_tracing_disabled
 import streamlit as st
 from pageindex import PageIndexClient  # type: ignore
+
+set_tracing_disabled(os.getenv("OPENAI_AGENTS_DISABLE_TRACING", "1").strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
 # ----------------------------
@@ -77,7 +85,12 @@ def compact_text(value: Any, limit: int = 2_000) -> str:
     return text[:limit] + "\n... [sortie tronquée]"
 
 
-def configure_llm_environment(*, llm_api_key: str, llm_base_url: str) -> Dict[str, str]:
+def configure_llm_environment(
+    *,
+    llm_api_key: str,
+    llm_base_url: str,
+    disable_tracing: bool = True,
+) -> Dict[str, str]:
     """Expose the selected OpenAI-compatible endpoint to PageIndex/LiteLLM.
 
     PageIndex local mode delegates model calls to LiteLLM/OpenAI-compatible
@@ -89,6 +102,8 @@ def configure_llm_environment(*, llm_api_key: str, llm_base_url: str) -> Dict[st
     api_key = llm_api_key.strip()
     base_url = llm_base_url.strip().rstrip("/")
 
+    updates["OPENAI_AGENTS_DISABLE_TRACING"] = "1" if disable_tracing else "0"
+
     if api_key:
         updates["OPENAI_API_KEY"] = api_key
     if base_url:
@@ -96,6 +111,7 @@ def configure_llm_environment(*, llm_api_key: str, llm_base_url: str) -> Dict[st
         updates["OPENAI_API_BASE"] = base_url
 
     os.environ.update(updates)
+    set_tracing_disabled(disable_tracing)
     return updates
 
 
@@ -107,12 +123,17 @@ def get_pageindex_client(
     storage_path: Path,
     llm_api_key: str,
     llm_base_url: str,
+    disable_tracing: bool,
 ):
     kwargs: Dict[str, Any] = {}
     if api_key:
         kwargs["api_key"] = api_key
     else:
-        configure_llm_environment(llm_api_key=llm_api_key, llm_base_url=llm_base_url)
+        configure_llm_environment(
+            llm_api_key=llm_api_key,
+            llm_base_url=llm_base_url,
+            disable_tracing=disable_tracing,
+        )
         storage_path.mkdir(parents=True, exist_ok=True)
         kwargs["storage_path"] = str(storage_path)
         if model:
@@ -215,6 +236,7 @@ default_model = os.getenv("PAGEINDEX_MODEL", "")
 default_retrieve_model = os.getenv("PAGEINDEX_RETRIEVE_MODEL", default_model)
 default_llm_api_key = os.getenv("OPENAI_API_KEY", "")
 default_llm_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+default_disable_tracing = env_bool("OPENAI_AGENTS_DISABLE_TRACING", True)
 
 with st.sidebar:
     st.header("PageIndex")
@@ -246,14 +268,20 @@ with st.sidebar:
     pageindex_model = st.text_input(
         "PAGEINDEX_MODEL",
         value=default_model,
-        help="Modèle utilisé pour construire l'index en mode local. Vide = défaut PageIndex.",
+        help="Modèle utilisé pour construire l'index en mode local. Utilise le préfixe LiteLLM/provider si nécessaire, ex. openai/gpt-4o-mini, ollama_chat/llama3.1, vllm/<model>.",
         disabled=bool(pageindex_api_key),
     )
     pageindex_retrieve_model = st.text_input(
         "PAGEINDEX_RETRIEVE_MODEL",
         value=default_retrieve_model,
-        help="Modèle agentique utilisé par collection.query(...). Vide = défaut PageIndex.",
+        help="Modèle agentique utilisé par collection.query(...). Utilise le préfixe provider LiteLLM si ton serveur n'est pas OpenAI natif.",
         disabled=bool(pageindex_api_key),
+    )
+
+    disable_tracing = st.checkbox(
+        "Désactiver tracing OpenAI Agents",
+        value=default_disable_tracing,
+        help="Recommandé avec Ollama/vLLM/LiteLLM proxy : évite que l'Agents SDK tente d'envoyer des traces à OpenAI avec une clé locale/non-OpenAI.",
     )
 
     st.divider()
@@ -295,6 +323,7 @@ with col_left:
                         storage_path=storage_path,
                         llm_api_key=llm_api_key,
                         llm_base_url=llm_base_url,
+                        disable_tracing=disable_tracing,
                     )
                     pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
 
@@ -380,6 +409,7 @@ with col_right:
                         storage_path=Path(storage_path_text),
                         llm_api_key=llm_api_key,
                         llm_base_url=llm_base_url,
+                        disable_tracing=disable_tracing,
                     )
                     pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
                     answer = run_pageindex_query(

@@ -32,7 +32,7 @@ def load_helpers():
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
-    namespace = {}
+    namespace = {"set_tracing_disabled": lambda disabled: None}
     exec(compile(module, str(source), "exec"), namespace)
     return namespace
 
@@ -73,23 +73,52 @@ class PageIndexHelperTests(unittest.TestCase):
 
     def test_configure_llm_environment_sets_base_url_aliases(self):
         helpers = load_helpers()
-        original = {key: os.environ.get(key) for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE")}
+        original = {
+            key: os.environ.get(key)
+            for key in (
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "OPENAI_API_BASE",
+                "OPENAI_AGENTS_DISABLE_TRACING",
+            )
+        }
         try:
             updates = helpers["configure_llm_environment"](
                 llm_api_key="sk-test",
                 llm_base_url="http://localhost:8000/v1/",
+                disable_tracing=True,
             )
 
             self.assertEqual(updates["OPENAI_API_KEY"], "sk-test")
             self.assertEqual(updates["OPENAI_BASE_URL"], "http://localhost:8000/v1")
             self.assertEqual(updates["OPENAI_API_BASE"], "http://localhost:8000/v1")
+            self.assertEqual(updates["OPENAI_AGENTS_DISABLE_TRACING"], "1")
             self.assertEqual(os.environ["OPENAI_API_BASE"], "http://localhost:8000/v1")
+            self.assertEqual(os.environ["OPENAI_AGENTS_DISABLE_TRACING"], "1")
         finally:
             for key, value in original.items():
                 if value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_configure_llm_environment_can_enable_tracing(self):
+        helpers = load_helpers()
+        original = os.environ.get("OPENAI_AGENTS_DISABLE_TRACING")
+        try:
+            updates = helpers["configure_llm_environment"](
+                llm_api_key="",
+                llm_base_url="",
+                disable_tracing=False,
+            )
+
+            self.assertEqual(updates["OPENAI_AGENTS_DISABLE_TRACING"], "0")
+            self.assertEqual(os.environ["OPENAI_AGENTS_DISABLE_TRACING"], "0")
+        finally:
+            if original is None:
+                os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
+            else:
+                os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = original
 
 
 if __name__ == "__main__":
