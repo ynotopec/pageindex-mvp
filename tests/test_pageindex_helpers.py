@@ -1,0 +1,207 @@
+import ast
+import asyncio
+import inspect
+import os
+import unittest
+from pathlib import Path
+
+
+HELPER_NAMES = {
+    "safe_filename",
+    "file_digest",
+    "pageindex_value_to_text",
+    "compact_text",
+    "_doc_name_from_metadata",
+    "_doc_id_from_metadata",
+    "configure_llm_environment",
+    "sanitize_error_text",
+    "pageindex_query_result_to_text",
+    "build_pageindex_error_message",
+    "run_pageindex_query_non_stream",
+    "normalize_litellm_model_name",
+}
+
+
+def load_helpers():
+    source = Path(__file__).resolve().parents[1] / "app.py"
+    tree = ast.parse(source.read_text())
+    selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in HELPER_NAMES]
+    module = ast.Module(
+        body=[
+            ast.Import(names=[ast.alias(name="asyncio")]),
+            ast.Import(names=[ast.alias(name="hashlib")]),
+            ast.Import(names=[ast.alias(name="inspect")]),
+            ast.Import(names=[ast.alias(name="json")]),
+            ast.Import(names=[ast.alias(name="os")]),
+            ast.Import(names=[ast.alias(name="re")]),
+            ast.ImportFrom(module="pathlib", names=[ast.alias(name="Path")], level=0),
+            ast.ImportFrom(module="typing", names=[ast.alias(name="Any"), ast.alias(name="Dict"), ast.alias(name="List"), ast.alias(name="Optional")], level=0),
+            *selected,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    namespace = {"set_tracing_disabled": lambda disabled: None}
+    exec(compile(module, str(source), "exec"), namespace)
+    return namespace
+
+
+class PageIndexHelperTests(unittest.TestCase):
+    def test_safe_filename_removes_path_and_unsafe_characters(self):
+        helpers = load_helpers()
+
+        self.assertEqual(helpers["safe_filename"]("../Rapport final éco.pdf"), "Rapport_final_co.pdf")
+
+    def test_file_digest_is_stable_and_short(self):
+        helpers = load_helpers()
+
+        self.assertEqual(helpers["file_digest"](b"abc"), helpers["file_digest"](b"abc"))
+        self.assertEqual(len(helpers["file_digest"](b"abc")), 16)
+
+    def test_pageindex_value_to_text_serializes_json_values(self):
+        helpers = load_helpers()
+
+        text = helpers["pageindex_value_to_text"]([{"page": 1, "content": "Bonjour"}])
+
+        self.assertIn('"page": 1', text)
+        self.assertIn("Bonjour", text)
+
+    def test_doc_metadata_helpers_accept_pageindex_shapes(self):
+        helpers = load_helpers()
+        metadata = {"doc_id": "doc-1", "file_path": "/tmp/report.pdf"}
+
+        self.assertEqual(helpers["_doc_id_from_metadata"](metadata), "doc-1")
+        self.assertEqual(helpers["_doc_name_from_metadata"](metadata), "report.pdf")
+
+    def test_compact_text_truncates_long_values(self):
+        helpers = load_helpers()
+
+        text = helpers["compact_text"]("abcdef", limit=3)
+
+        self.assertEqual(text, "abc\n... [sortie tronquée]")
+
+    def test_configure_llm_environment_sets_base_url_aliases(self):
+        helpers = load_helpers()
+        original = {
+            key: os.environ.get(key)
+            for key in (
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "OPENAI_API_BASE",
+                "OPENAI_AGENTS_DISABLE_TRACING",
+            )
+        }
+        try:
+            updates = helpers["configure_llm_environment"](
+                llm_api_key="sk-test",
+                llm_base_url="http://localhost:8000/v1/",
+                disable_tracing=True,
+            )
+
+            self.assertEqual(updates["OPENAI_API_KEY"], "sk-test")
+            self.assertEqual(updates["OPENAI_BASE_URL"], "http://localhost:8000/v1")
+            self.assertEqual(updates["OPENAI_API_BASE"], "http://localhost:8000/v1")
+            self.assertEqual(updates["OPENAI_AGENTS_DISABLE_TRACING"], "1")
+            self.assertEqual(os.environ["OPENAI_API_BASE"], "http://localhost:8000/v1")
+            self.assertEqual(os.environ["OPENAI_AGENTS_DISABLE_TRACING"], "1")
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_configure_llm_environment_can_enable_tracing(self):
+        helpers = load_helpers()
+        original = os.environ.get("OPENAI_AGENTS_DISABLE_TRACING")
+        try:
+            updates = helpers["configure_llm_environment"](
+                llm_api_key="",
+                llm_base_url="",
+                disable_tracing=False,
+            )
+
+            self.assertEqual(updates["OPENAI_AGENTS_DISABLE_TRACING"], "0")
+            self.assertEqual(os.environ["OPENAI_AGENTS_DISABLE_TRACING"], "0")
+        finally:
+            if original is None:
+                os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
+            else:
+                os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = original
+
+    def test_sanitize_error_text_redacts_api_keys(self):
+        helpers = load_helpers()
+
+        text = helpers["sanitize_error_text"]("Incorrect API key provided: sk-secret123456")
+
+        self.assertIn("[redacted]", text)
+        self.assertNotIn("sk-secret123456", text)
+
+    def test_pageindex_query_result_to_text_extracts_answer_shapes(self):
+        helpers = load_helpers()
+
+        self.assertEqual(helpers["pageindex_query_result_to_text"]({"answer": "Bonjour"}), "Bonjour")
+
+    def test_build_pageindex_error_message_includes_provider_hint(self):
+        helpers = load_helpers()
+
+        text = helpers["build_pageindex_error_message"](stream_error=RuntimeError("Internal Server Error"))
+
+        self.assertIn("OPENAI_BASE_URL", text)
+        self.assertIn("Provider List", text)
+
+    def test_non_stream_query_helper_requires_no_running_loop(self):
+        helpers = load_helpers()
+
+        class FakeCollection:
+            def query(self, question, doc_ids=None, stream=False):
+                self.question = question
+                self.doc_ids = doc_ids
+                self.stream = stream
+                return {"answer": "Réponse non-stream"}
+
+        collection = FakeCollection()
+        answer = helpers["run_pageindex_query_non_stream"](
+            collection=collection,
+            question="Question ?",
+            doc_ids=["doc-1"],
+        )
+
+        self.assertEqual(answer, "Réponse non-stream")
+        self.assertEqual(collection.question, "Question ?")
+        self.assertEqual(collection.doc_ids, ["doc-1"])
+        self.assertFalse(collection.stream)
+
+    def test_non_stream_query_helper_rejects_running_event_loop(self):
+        helpers = load_helpers()
+
+        async def call_helper():
+            with self.assertRaisesRegex(RuntimeError, "hors de la boucle asyncio"):
+                helpers["run_pageindex_query_non_stream"](
+                    collection=object(),
+                    question="Question ?",
+                    doc_ids=[],
+                )
+
+        asyncio.run(call_helper())
+
+    def test_normalize_litellm_model_name_adds_agents_prefix(self):
+        helpers = load_helpers()
+
+        self.assertEqual(
+            helpers["normalize_litellm_model_name"]("openai/gpt-4o-mini"),
+            "litellm/openai/gpt-4o-mini",
+        )
+        self.assertEqual(
+            helpers["normalize_litellm_model_name"]("ollama_chat/llama3.1"),
+            "litellm/ollama_chat/llama3.1",
+        )
+        self.assertEqual(
+            helpers["normalize_litellm_model_name"]("litellm/vllm/model"),
+            "litellm/vllm/model",
+        )
+        self.assertEqual(helpers["normalize_litellm_model_name"](""), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,60 +1,44 @@
 #!/usr/bin/env python3
 """
-Streamlit PDF Q&A MVP.
+Streamlit PageIndex document Q&A app.
 
-Version orientée vrai PageIndex :
-1. upload PDF ;
-2. indexation via VectifyAI/PageIndex si disponible ;
-3. lecture de la structure PageIndex avec get_document_structure() ;
-4. sélection de pages par le LLM ;
-5. récupération ciblée avec get_page_content() ;
-6. réponse uniquement depuis le contexte récupéré.
+This version intentionally removes the former lexical/chunk fallback. All
+indexing and retrieval now go through VectifyAI/PageIndex's Collection API:
 
-Fallback automatique : si PageIndex n'est pas installé ou échoue, l'application
-revient au RAG lexical simple sans embeddings ni vector DB.
+1. upload PDF or Markdown files;
+2. index them with collection.add(...), which builds PageIndex's hierarchical
+   tree index;
+3. answer questions with collection.query(...), letting the PageIndex agent use
+   list_documents, get_document, get_document_structure and get_page_content.
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import hashlib
+import inspect
 import json
 import os
 import re
-from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
-import requests
+# Disable OpenAI Agents trace export by default before PageIndex imports the
+# agents SDK. Local/OpenAI-compatible keys are often not valid OpenAI platform
+# keys, so exporting traces can otherwise create noisy 401 warnings.
+os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
+
+from agents import set_tracing_disabled
 import streamlit as st
-from openai import OpenAI
-from pypdf import PdfReader
+from pageindex import PageIndexClient  # type: ignore
 
-PAGEINDEX_IMPORT_ERROR = None
-
-try:
-    from pageindex import PageIndexClient  # type: ignore
-except Exception as exc:
-    PageIndexClient = None  # type: ignore
-    PAGEINDEX_IMPORT_ERROR = repr(exc)
+set_tracing_disabled(os.getenv("OPENAI_AGENTS_DISABLE_TRACING", "1").strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
 # ----------------------------
 # Env helpers
 # ----------------------------
-def env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
 def env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -63,248 +47,18 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 # ----------------------------
-# PDF -> texte fallback
-# ----------------------------
-def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
-    reader = PdfReader(BytesIO(pdf_bytes))
-    pages: List[str] = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        text = text.replace("\x00", " ")
-        pages.append(text)
-    return "\n\n".join(pages)
-
-
-# ----------------------------
-# Chunking lexical fallback
-# ----------------------------
-def normalize_text(text: str) -> str:
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
-    if max_chars <= 0:
-        raise ValueError("max_chars must be > 0")
-
-    overlap = max(0, min(overlap, max_chars - 1))
-    text = normalize_text(text)
-
-    chunks: List[str] = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(n, start + max_chars)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        start = max(0, end - overlap)
-        if end == n:
-            break
-    return chunks
-
-
-def tokenize(value: str) -> List[str]:
-    return re.findall(r"[a-zA-ZÀ-ÿ0-9]{2,}", value.lower())
-
-
-def score_chunk(query: str, chunk: str) -> int:
-    query_terms = set(tokenize(query))
-    chunk_words = tokenize(chunk)
-    if not query_terms or not chunk_words:
-        return 0
-
-    hits = sum(1 for word in chunk_words if word in query_terms)
-    uniq = len(set(chunk_words) & query_terms)
-
-    query_norm = " ".join(tokenize(query))
-    chunk_norm = " ".join(chunk_words)
-    phrase_bonus = 25 if query_norm and query_norm in chunk_norm else 0
-
-    return hits + 2 * uniq + phrase_bonus
-
-
-def top_k_chunks(query: str, chunks: List[dict], k: int = 4) -> List[Tuple[int, dict]]:
-    scored = [(score_chunk(query, item["text"]), item) for item in chunks]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [(score, item) for score, item in scored[:k] if score > 0]
-
-
-def build_matched_lexical_context(
-    question: str,
-    chunks: List[dict],
-    k: int,
-    *,
-    mode: str = "lexical",
-) -> Tuple[str, List[dict]]:
-    """Build context from the best lexical matches only.
-
-    This helper intentionally has no beginning-of-document fallback. It is used
-    both by the pure lexical retriever and as a complement to PageIndex, where
-    adding unrelated first pages can hide the actual repeated matches the user
-    asked about.
-    """
-    selected = top_k_chunks(question, chunks, k=k)
-    if not selected:
-        return "", []
-
-    context = "\n\n".join(
-        f"[CHUNK score={score} doc={item['doc_name']} idx={item['chunk_id']}]\n{item['text']}"
-        for score, item in selected
-    )
-    traces = [
-        {
-            "mode": mode,
-            "doc": item["doc_name"],
-            "chunk": item["chunk_id"],
-            "score": score,
-        }
-        for score, item in selected
-    ]
-    return context, traces
-
-
-def build_lexical_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[dict]]:
-    context, traces = build_matched_lexical_context(question, chunks, k, mode="lexical")
-    if context:
-        return context, traces
-
-    fallback_items = chunks[:2]
-    fallback_context = "\n\n".join(
-        f"[CHUNK score=0 doc={item['doc_name']} idx={item['chunk_id']}]\n{item['text']}"
-        for item in fallback_items
-    )
-    traces = [
-        {
-            "mode": "lexical_fallback_start",
-            "doc": item["doc_name"],
-            "chunk": item["chunk_id"],
-            "score": 0,
-        }
-        for item in fallback_items
-    ]
-    return fallback_context, traces
-
-
-def append_context_part(base: str, addition: str, max_chars: int) -> str:
-    """Append a retrieval block while preserving the global context limit."""
-    if not addition.strip():
-        return base.strip()
-
-    combined = "\n\n".join(part for part in (base.strip(), addition.strip()) if part)
-    if len(combined) <= max_chars:
-        return combined
-    return combined[:max_chars] + "\n... [contexte tronqué]"
-
-
-# ----------------------------
-# LLM providers
-# ----------------------------
-def ollama_chat_stream(
-    model: str,
-    host: str,
-    messages: List[dict],
-    temperature: float,
-    max_tokens: int,
-) -> Iterable[str]:
-    url = f"{host.rstrip('/')}/api/chat"
-    payload = {
-        "model": model,
-        "stream": True,
-        "messages": messages,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
-    }
-
-    with requests.post(url, json=payload, stream=True, timeout=300) as response:
-        response.raise_for_status()
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            data = json.loads(line)
-            chunk = (data.get("message") or {}).get("content")
-            if chunk:
-                yield chunk
-            if data.get("done") is True:
-                break
-
-
-def openai_compatible_chat_stream(
-    model: str,
-    base_url: str,
-    api_key: str,
-    messages: List[dict],
-    temperature: float,
-    max_tokens: int,
-) -> Iterable[str]:
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY est requis avec le provider openai_compatible.")
-
-    client = OpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True,
-    )
-    for event in stream:
-        if not event.choices:
-            continue
-        delta = event.choices[0].delta.content
-        if delta:
-            yield delta
-
-
-def chat_stream(
-    *,
-    provider: str,
-    messages: List[dict],
-    ollama_host: str,
-    ollama_model: str,
-    openai_base_url: str,
-    openai_api_key: str,
-    openai_model: str,
-    temperature: float,
-    max_tokens: int,
-) -> Iterable[str]:
-    if provider == "openai_compatible":
-        yield from openai_compatible_chat_stream(
-            model=openai_model,
-            base_url=openai_base_url,
-            api_key=openai_api_key,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return
-
-    yield from ollama_chat_stream(
-        model=ollama_model,
-        host=ollama_host,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-
-
-def chat_complete(*, max_tokens: int = 512, **kwargs: Any) -> str:
-    return "".join(chat_stream(max_tokens=max_tokens, **kwargs)).strip()
-
-
-# ----------------------------
-# PageIndex integration
+# File / PageIndex helpers
 # ----------------------------
 def safe_filename(name: str) -> str:
     base = Path(name).name
-    return re.sub(r"[^a-zA-Z0-9._-]+", "_", base).strip("._") or "document.pdf"
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", base).strip("._") or "document"
 
 
 def file_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
-def write_uploaded_pdf(workspace: Path, file_name: str, data: bytes) -> Path:
+def write_uploaded_document(workspace: Path, file_name: str, data: bytes) -> Path:
     upload_dir = workspace / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     path = upload_dir / f"{file_digest(data)}_{safe_filename(file_name)}"
@@ -313,29 +67,147 @@ def write_uploaded_pdf(workspace: Path, file_name: str, data: bytes) -> Path:
     return path
 
 
-def get_pageindex_client(workspace: Path):
-    if PageIndexClient is None:
-        raise RuntimeError(
-            "PageIndex n'est pas installé/importable. "
-            f"Erreur import: {PAGEINDEX_IMPORT_ERROR}"
-        )
+def pageindex_value_to_text(value: Any) -> str:
+    """Convert PageIndex SDK responses/events into prompt- or UI-safe text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except TypeError:
+        return str(value)
 
-    workspace.mkdir(parents=True, exist_ok=True)
 
-    # PageIndex dev attend storage_path=..., pas workspace=...
-    # PAGEINDEX_MODEL peut être utile si tu ne veux pas le modèle par défaut.
-    model = os.getenv("PAGEINDEX_MODEL") or None
-    retrieve_model = os.getenv("PAGEINDEX_RETRIEVE_MODEL") or None
+def compact_text(value: Any, limit: int = 2_000) -> str:
+    text = pageindex_value_to_text(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n... [sortie tronquée]"
 
-    return PageIndexClient(
-        model=model,
-        retrieve_model=retrieve_model,
-        storage_path=str(workspace),
+
+
+def sanitize_error_text(value: Any) -> str:
+    """Return a UI-safe error message without leaking API keys."""
+    text = pageindex_value_to_text(value).strip()
+    if not text:
+        return "Erreur inconnue."
+
+    text = re.sub(
+        r"(?i)(api key(?: provided)?\s*[:=]\s*)[^\s,}\]]+",
+        r"\1[redacted]",
+        text,
     )
+    text = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "sk-[redacted]", text)
+    return text
 
 
-def get_pageindex_collection(client: Any):
-    collection_name = os.getenv("PAGEINDEX_COLLECTION", "default")
+def pageindex_query_result_to_text(result: Any) -> str:
+    """Extract answer text from non-streaming PageIndex query responses."""
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, dict):
+        for key in ("answer", "content", "text", "response", "result"):
+            value = result.get(key)
+            if value:
+                return pageindex_value_to_text(value).strip()
+    for attr in ("answer", "content", "text", "response", "result"):
+        value = getattr(result, attr, None)
+        if value:
+            return pageindex_value_to_text(value).strip()
+    return pageindex_value_to_text(result).strip()
+
+
+def build_pageindex_error_message(*, stream_error: BaseException, retry_error: Optional[BaseException] = None) -> str:
+    message = "Le streaming PageIndex a échoué."
+    message += f" Détail streaming: {sanitize_error_text(stream_error)}"
+    if retry_error is not None:
+        message += f" Détail retry non-stream: {sanitize_error_text(retry_error)}"
+    message += (
+        " Vérifie OPENAI_BASE_URL/OPENAI_API_BASE, OPENAI_API_KEY, PAGEINDEX_MODEL "
+        "et PAGEINDEX_RETRIEVE_MODEL. Si LiteLLM affiche Provider List, utilise un modèle "
+        "préfixé litellm/provider/... (ex. litellm/openai/..., litellm/ollama_chat/..., "
+        "litellm/vllm/...)."
+    )
+    return message
+
+
+def normalize_litellm_model_name(model: str) -> str:
+    """Route local PageIndex models through the Agents SDK LiteLLM provider.
+
+    PageIndex passes the model string directly to OpenAI Agents. In that SDK,
+    provider-prefixed LiteLLM routing requires a top-level ``litellm/`` prefix
+    (for example ``litellm/openai/gpt-4o-mini`` or
+    ``litellm/ollama_chat/llama3.1``). Without it, ``openai/...`` uses the
+    default OpenAI provider/Responses path, which often fails against local
+    OpenAI-compatible servers.
+    """
+    value = model.strip()
+    if not value or value.startswith(("litellm/", "any-llm/")):
+        return value
+    return f"litellm/{value}"
+
+def configure_llm_environment(
+    *,
+    llm_api_key: str,
+    llm_base_url: str,
+    disable_tracing: bool = True,
+) -> Dict[str, str]:
+    """Expose the selected OpenAI-compatible endpoint to PageIndex/LiteLLM.
+
+    PageIndex local mode delegates model calls to LiteLLM/OpenAI-compatible
+    clients, which read their endpoint from environment variables. Set both
+    commonly used names so vLLM, LiteLLM proxy, Ollama OpenAI mode and OpenAI
+    SDK-compatible providers all receive the same base URL.
+    """
+    updates: Dict[str, str] = {}
+    api_key = llm_api_key.strip()
+    base_url = llm_base_url.strip().rstrip("/")
+
+    updates["OPENAI_AGENTS_DISABLE_TRACING"] = "1" if disable_tracing else "0"
+
+    if api_key:
+        updates["OPENAI_API_KEY"] = api_key
+    if base_url:
+        updates["OPENAI_BASE_URL"] = base_url
+        updates["OPENAI_API_BASE"] = base_url
+
+    os.environ.update(updates)
+    set_tracing_disabled(disable_tracing)
+    return updates
+
+
+def get_pageindex_client(
+    *,
+    api_key: str,
+    model: str,
+    retrieve_model: str,
+    storage_path: Path,
+    llm_api_key: str,
+    llm_base_url: str,
+    disable_tracing: bool,
+):
+    kwargs: Dict[str, Any] = {}
+    if api_key:
+        kwargs["api_key"] = api_key
+    else:
+        configure_llm_environment(
+            llm_api_key=llm_api_key,
+            llm_base_url=llm_base_url,
+            disable_tracing=disable_tracing,
+        )
+        storage_path.mkdir(parents=True, exist_ok=True)
+        kwargs["storage_path"] = str(storage_path)
+        if model:
+            kwargs["model"] = normalize_litellm_model_name(model)
+        if retrieve_model:
+            kwargs["retrieve_model"] = normalize_litellm_model_name(retrieve_model)
+    return PageIndexClient(**kwargs)
+
+
+def get_pageindex_collection(client: Any, collection_name: str):
     return client.collection(collection_name)
 
 
@@ -344,7 +216,7 @@ def _doc_name_from_metadata(doc: dict) -> str:
         value = doc.get(key)
         if value:
             return str(value)
-    path = doc.get("path") or doc.get("file_path") or doc.get("source")
+    path = doc.get("file_path") or doc.get("path") or doc.get("source")
     if path:
         return Path(str(path)).name
     return ""
@@ -358,256 +230,172 @@ def _doc_id_from_metadata(doc: dict) -> Optional[str]:
     return None
 
 
-def find_cached_doc_id(collection: Any, pdf_path: Path) -> Optional[str]:
-    try:
-        for doc in collection.list_documents():
-            if _doc_name_from_metadata(doc) == pdf_path.name:
-                return _doc_id_from_metadata(doc)
-    except Exception:
-        return None
+def find_cached_doc_id(collection: Any, stored_path: Path) -> Optional[str]:
+    for doc in collection.list_documents():
+        doc_id = _doc_id_from_metadata(doc)
+        if doc_id and _doc_name_from_metadata(doc) == stored_path.name:
+            return doc_id
     return None
 
 
-def index_with_pageindex(collection: Any, pdf_path: Path) -> str:
-    cached = find_cached_doc_id(collection, pdf_path)
+def index_with_pageindex(collection: Any, stored_path: Path) -> str:
+    cached = find_cached_doc_id(collection, stored_path)
     if cached:
         return cached
-    return str(collection.add(str(pdf_path)))
+    return str(collection.add(str(stored_path)))
 
 
-def pageindex_value_to_text(value: Any) -> str:
-    """Convert PageIndex SDK responses into prompt-safe text.
-
-    Depending on the PageIndex version, methods such as
-    ``get_document_structure`` and ``get_page_content`` may return plain
-    strings, lists, dictionaries, or other JSON-serialisable objects. The
-    chat pipeline expects text, so centralise the conversion here instead of
-    calling string-only methods such as ``strip`` directly on SDK responses.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
+def run_pageindex_query_non_stream(*, collection: Any, question: str, doc_ids: List[str]) -> str:
+    """Run PageIndex non-streaming query from a context without an active event loop."""
     try:
-        return json.dumps(value, ensure_ascii=False, indent=2)
-    except TypeError:
-        return str(value)
+        asyncio.get_running_loop()
+    except RuntimeError:
+        retry_result = collection.query(question, doc_ids=doc_ids or None, stream=False)
+        if inspect.isawaitable(retry_result):
+            retry_result = asyncio.run(retry_result)
+        return pageindex_query_result_to_text(retry_result)
+
+    raise RuntimeError(
+        "run_pageindex_query_non_stream doit être exécuté hors de la boucle asyncio active."
+    )
 
 
-def compact_structure(structure: Any, limit: int) -> str:
-    structure_text = pageindex_value_to_text(structure).strip()
-    if len(structure_text) <= limit:
-        return structure_text
-    return structure_text[:limit] + "\n... [structure tronquée]"
+def run_pageindex_query(
+    *,
+    collection: Any,
+    question: str,
+    doc_ids: List[str],
+    on_answer_delta: Callable[[str], None],
+    on_trace: Callable[[dict], None],
+) -> str:
+    """Run PageIndex query with streaming, then retry PageIndex non-stream on stream failure."""
 
-
-def extract_json_object(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if match:
+    async def consume_stream() -> str:
+        final_answer_parts: List[str] = []
+        final_answer = ""
         try:
-            return json.loads(match.group(0))
-        except Exception:
-            return {}
-    return {}
+            stream = collection.query(question, doc_ids=doc_ids or None, stream=True)
+            async for event in stream:
+                event_type = getattr(event, "type", "")
+                data = getattr(event, "data", None)
+                if event_type == "answer_delta":
+                    delta = str(data or "")
+                    final_answer_parts.append(delta)
+                    on_answer_delta(delta)
+                elif event_type == "answer_done":
+                    final_answer = str(data or "")
+                elif event_type in {"reasoning", "tool_call", "tool_result"}:
+                    trace = {"type": event_type}
+                    if event_type == "tool_result":
+                        trace["data"] = compact_text(data)
+                    else:
+                        trace["data"] = data
+                    on_trace(trace)
+                elif event_type in {"error", "exception"}:
+                    raise RuntimeError(sanitize_error_text(data))
+            return final_answer or "".join(final_answer_parts)
+        except Exception as stream_exc:
+            on_trace({"type": "stream_error", "data": sanitize_error_text(stream_exc)})
+            try:
+                retry_answer = await asyncio.to_thread(
+                    run_pageindex_query_non_stream,
+                    collection=collection,
+                    question=question,
+                    doc_ids=doc_ids,
+                )
+                if retry_answer:
+                    on_trace({"type": "non_stream_retry", "data": "Réponse récupérée après échec du streaming."})
+                    return retry_answer
+                raise RuntimeError("Le retry PageIndex non-stream n'a retourné aucune réponse.")
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    build_pageindex_error_message(stream_error=stream_exc, retry_error=retry_exc)
+                ) from retry_exc
 
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(consume_stream()).strip()
 
-def normalize_pages(value: Any, default_pages: str) -> str:
-    if isinstance(value, list):
-        value = ",".join(str(v) for v in value)
-    value = str(value or "").strip()
-
-    # Formes acceptées : 1, 1-3, 1,3,7-8.
-    candidates = re.findall(r"\d+(?:\s*-\s*\d+)?", value)
-    if not candidates:
-        return default_pages
-
-    return ",".join(part.replace(" ", "") for part in candidates[:8])
-
-
-def choose_pageindex_ranges(
-    *,
-    question: str,
-    doc_name: str,
-    structure: str,
-    default_pages: str,
-    llm_kwargs: Dict[str, Any],
-    max_structure_chars: int,
-) -> Tuple[str, str]:
-    system = (
-        "Tu sélectionnes les pages ou lignes utiles dans une structure PageIndex. "
-        "Réponds uniquement en JSON valide."
-    )
-    user = f"""
-DOCUMENT: {doc_name}
-QUESTION: {question}
-
-STRUCTURE PAGEINDEX:
-{compact_structure(structure, max_structure_chars)}
-
-Retourne uniquement ce JSON :
-{{"pages":"1-3,5", "reason":"raison très courte"}}
-
-Règles :
-- Choisis des plages serrées.
-- Ne récupère jamais tout le document.
-- Si la structure ne suffit pas, prends le début logique du document : {default_pages}.
-""".strip()
-
-    raw = chat_complete(
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.0,
-        max_tokens=256,
-        **llm_kwargs,
-    )
-    data = extract_json_object(raw)
-    pages = normalize_pages(data.get("pages"), default_pages=default_pages)
-    reason = str(data.get("reason") or "Sélection automatique via structure PageIndex.").strip()
-    return pages, reason
-
-
-def build_pageindex_context(
-    *,
-    client: Any,
-    question: str,
-    documents: List[dict],
-    llm_kwargs: Dict[str, Any],
-    max_docs: int,
-    default_pages: str,
-    max_structure_chars: int,
-    max_context_chars: int,
-) -> Tuple[str, List[dict]]:
-    parts: List[str] = []
-    traces: List[dict] = []
-
-    for doc in documents[:max_docs]:
-        doc_id = doc["doc_id"]
-        doc_name = doc["name"]
-
-        structure = client.get_document_structure(doc_id)
-        pages, reason = choose_pageindex_ranges(
-            question=question,
-            doc_name=doc_name,
-            structure=structure,
-            default_pages=default_pages,
-            llm_kwargs=llm_kwargs,
-            max_structure_chars=max_structure_chars,
-        )
-        content = pageindex_value_to_text(client.get_page_content(doc_id, pages))
-
-        traces.append(
-            {
-                "mode": "pageindex",
-                "doc": doc_name,
-                "doc_id": doc_id,
-                "pages": pages,
-                "reason": reason,
-            }
-        )
-        parts.append(f"[PAGEINDEX doc={doc_name} pages={pages} reason={reason}]\n{content}")
-
-    context = "\n\n".join(parts).strip()
-    if len(context) > max_context_chars:
-        context = context[:max_context_chars] + "\n... [contexte tronqué]"
-    return context, traces
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(consume_stream())).result().strip()
 
 
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="PDF → Q&A PageIndex", layout="wide")
-st.title("PDF → Q&A avec PageIndex")
-st.caption("Vrai PageIndex si disponible. Fallback lexical simple sans embeddings.")
+st.set_page_config(page_title="PDF/Markdown → Q&A PageIndex", layout="wide")
+st.title("PDF/Markdown → Q&A avec PageIndex")
+st.caption("Retrieval 100% PageIndex : index hiérarchique, agent tools, sans fallback lexical ni chunks locaux.")
 
 workspace = Path(os.getenv("PAGEINDEX_WORKSPACE", ".pageindex_workspace"))
-default_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
-default_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-default_ollama_model = os.getenv("OLLAMA_MODEL", "gpt-oss")
-default_openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-default_openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-default_openai_api_key = os.getenv("OPENAI_API_KEY", "")
-default_temperature = env_float("LLM_TEMPERATURE", 0.0)
-default_max_tokens = env_int("LLM_MAX_TOKENS", 1024)
+default_api_key = os.getenv("PAGEINDEX_API_KEY", "")
+default_collection = os.getenv("PAGEINDEX_COLLECTION", "default")
+default_model = os.getenv("PAGEINDEX_MODEL", "")
+default_retrieve_model = os.getenv("PAGEINDEX_RETRIEVE_MODEL", default_model)
+default_llm_api_key = os.getenv("OPENAI_API_KEY", "")
+default_llm_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+default_disable_tracing = env_bool("OPENAI_AGENTS_DISABLE_TRACING", True)
 
 with st.sidebar:
-    st.header("Paramètres")
+    st.header("PageIndex")
+    pageindex_api_key = st.text_input(
+        "PageIndex API key (cloud, optionnel)",
+        value=default_api_key,
+        type="password",
+        help="Si renseigné, PageIndex fonctionne en mode cloud. Sinon l'app utilise le mode local self-hosted.",
+    )
+    collection_name = st.text_input("Collection", value=default_collection)
+    storage_path_text = st.text_input("Storage local", value=str(workspace))
 
-    retrieval_mode = st.selectbox(
-        "Mode retrieval",
-        ["pageindex", "lexical"],
-        index=0 if env_bool("USE_PAGEINDEX", True) else 1,
-        help="PageIndex utilise get_document_structure/get_page_content. Lexical garde le fallback top-k chunks.",
+    st.subheader("LLM local / OpenAI-compatible")
+    llm_api_key = st.text_input(
+        "OPENAI_API_KEY",
+        value=default_llm_api_key,
+        type="password",
+        help="Token envoyé au serveur LLM en mode local PageIndex.",
+        disabled=bool(pageindex_api_key),
+    )
+    llm_base_url = st.text_input(
+        "OPENAI_BASE_URL / OPENAI_API_BASE",
+        value=default_llm_base_url,
+        help="URL du serveur LLM OpenAI-compatible, par exemple https://api.openai.com/v1, http://localhost:8000/v1 ou http://localhost:11434/v1.",
+        disabled=bool(pageindex_api_key),
     )
 
-    provider_options = ["ollama", "openai_compatible"]
-    provider_index = provider_options.index(default_provider) if default_provider in provider_options else 0
-    provider = st.selectbox("Provider LLM", provider_options, index=provider_index)
-
-    with st.expander("Ollama", expanded=(provider == "ollama")):
-        ollama_host = st.text_input("Ollama host", value=default_ollama_host)
-        ollama_model = st.text_input("Modèle Ollama", value=default_ollama_model)
-
-    with st.expander("API OpenAI-compatible", expanded=(provider == "openai_compatible")):
-        openai_base_url = st.text_input("Base URL", value=default_openai_base_url)
-        openai_model = st.text_input("Modèle API", value=default_openai_model)
-        openai_api_key = st.text_input("Token API", value=default_openai_api_key, type="password")
-
-    st.divider()
-    st.subheader("PageIndex")
-    pageindex_max_docs = st.slider("Documents PageIndex interrogés", 1, 5, env_int("PAGEINDEX_MAX_DOCS", 3))
-    pageindex_default_pages = st.text_input("Pages fallback", os.getenv("PAGEINDEX_DEFAULT_PAGES", "1-3"))
-    max_structure_chars = st.slider(
-        "Structure max chars",
-        2_000,
-        50_000,
-        env_int("PAGEINDEX_MAX_STRUCTURE_CHARS", 16_000),
-        step=1_000,
+    st.subheader("Modèles locaux")
+    pageindex_model = st.text_input(
+        "PAGEINDEX_MODEL",
+        value=default_model,
+        help="Modèle LiteLLM utilisé pour construire l'index. L'app ajoute litellm/ si absent; exemples: openai/gpt-4o-mini, ollama_chat/llama3.1, vllm/<model>.",
+        disabled=bool(pageindex_api_key),
     )
-    max_context_chars = st.slider(
-        "Contexte max chars",
-        4_000,
-        80_000,
-        env_int("MAX_CONTEXT_CHARS", 24_000),
-        step=1_000,
+    pageindex_retrieve_model = st.text_input(
+        "PAGEINDEX_RETRIEVE_MODEL",
+        value=default_retrieve_model,
+        help="Modèle agentique utilisé par collection.query(...). L'app force le routage OpenAI Agents via LiteLLM avec le préfixe litellm/.",
+        disabled=bool(pageindex_api_key),
+    )
+
+    disable_tracing = st.checkbox(
+        "Désactiver tracing OpenAI Agents",
+        value=default_disable_tracing,
+        help="Recommandé avec Ollama/vLLM/LiteLLM proxy : évite que l'Agents SDK tente d'envoyer des traces à OpenAI avec une clé locale/non-OpenAI.",
     )
 
     st.divider()
-    st.subheader("Fallback lexical")
-    k = st.slider("Top-K chunks", 1, 10, env_int("TOP_K", 4))
-    max_chars = st.slider("Taille chunk", 600, 8000, env_int("CHUNK_MAX_CHARS", 2400), step=100)
-    overlap = st.slider("Overlap", 0, 1000, env_int("CHUNK_OVERLAP", 200), step=50)
+    show_traces = st.checkbox("Afficher appels outils PageIndex", value=env_bool("PAGEINDEX_SHOW_TRACES", False))
 
-    st.divider()
-    temperature = st.slider("Température", 0.0, 2.0, default_temperature, step=0.1)
-    max_tokens = st.slider("Max tokens", 128, 8192, default_max_tokens, step=128)
-    show_context = st.checkbox("Afficher contexte / traces", value=False)
-
-if overlap >= max_chars:
-    st.sidebar.warning("Overlap doit être inférieur à la taille de chunk. Il sera automatiquement réduit.")
-
-llm_kwargs = {
-    "provider": provider,
-    "ollama_host": ollama_host,
-    "ollama_model": ollama_model,
-    "openai_base_url": openai_base_url,
-    "openai_api_key": openai_api_key,
-    "openai_model": openai_model,
-}
-
-uploaded_files = st.file_uploader("Upload un ou plusieurs PDF", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Upload un ou plusieurs documents",
+    type=["pdf", "md", "markdown"],
+    accept_multiple_files=True,
+)
 
 for key, default in {
-    "pdf_text": "",
     "documents": [],
-    "chunks": [],
     "chat": [],
-    "pageindex_enabled": False,
-    "pageindex_error": "",
+    "last_traces": [],
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -615,103 +403,77 @@ for key, default in {
 col_left, col_right = st.columns([1, 1], gap="large")
 
 with col_left:
-    st.subheader("1) Indexation")
-
-    if PageIndexClient is None and retrieval_mode == "pageindex":
-        st.warning(
-            "PageIndex n'est pas importable. "
-            f"Erreur: {PAGEINDEX_IMPORT_ERROR}. "
-            "Vérifie que Streamlit est lancé avec `uv run streamlit run app.py`."
-        )
+    st.subheader("1) Indexation PageIndex")
 
     if not uploaded_files:
-        st.info("Charge un ou plusieurs PDF pour commencer.")
+        st.info("Charge un ou plusieurs PDF/Markdown pour commencer.")
     else:
         st.caption(f"{len(uploaded_files)} fichier(s) sélectionné(s).")
-        if st.button("Indexer les PDF", type="primary"):
-            all_texts: List[str] = []
-            all_chunks: List[dict] = []
+        if st.button("Indexer avec PageIndex", type="primary"):
             docs: List[dict] = []
-            pageindex_error = ""
-            pageindex_enabled = False
-            pageindex_collection = None
+            storage_path = Path(storage_path_text)
 
-            if retrieval_mode == "pageindex" and PageIndexClient is not None:
+            with st.spinner("Construction de l'index hiérarchique PageIndex…"):
                 try:
-                    pageindex_client = get_pageindex_client(workspace)
-                    pageindex_collection = get_pageindex_collection(pageindex_client)
+                    pageindex_client = get_pageindex_client(
+                        api_key=pageindex_api_key,
+                        model=pageindex_model,
+                        retrieve_model=pageindex_retrieve_model,
+                        storage_path=storage_path,
+                        llm_api_key=llm_api_key,
+                        llm_base_url=llm_base_url,
+                        disable_tracing=disable_tracing,
+                    )
+                    pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
+
+                    for file in uploaded_files:
+                        data = file.read()
+                        stored_path = write_uploaded_document(storage_path, file.name, data)
+                        doc_id = index_with_pageindex(pageindex_collection, stored_path)
+                        metadata = pageindex_collection.get_document(doc_id)
+                        docs.append(
+                            {
+                                "name": file.name,
+                                "stored_name": stored_path.name,
+                                "path": str(stored_path),
+                                "doc_id": doc_id,
+                                "metadata": metadata,
+                            }
+                        )
                 except Exception as exc:
-                    pageindex_error = str(exc)
+                    st.error(f"Indexation PageIndex impossible : {exc}")
+                    docs = []
 
-            with st.spinner("Indexation des documents…"):
-                for file in uploaded_files:
-                    pdf_bytes = file.read()
-                    pdf_path = write_uploaded_pdf(workspace, file.name, pdf_bytes)
-
-                    doc_entry: Dict[str, Any] = {
-                        "name": file.name,
-                        "path": str(pdf_path),
-                        "mode": "lexical",
-                    }
-
-                    if pageindex_collection is not None:
-                        try:
-                            doc_id = index_with_pageindex(pageindex_collection, pdf_path)
-                            doc_entry.update({"doc_id": doc_id, "mode": "pageindex"})
-                            pageindex_enabled = True
-                        except Exception as exc:
-                            pageindex_error = f"PageIndex a échoué pour {file.name}: {exc}"
-
-                    text = pdf_bytes_to_text(pdf_bytes)
-                    if text.strip():
-                        doc_chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
-                        doc_entry.update({"text_chars": len(text), "chunks": len(doc_chunks)})
-                        all_texts.append(f"===== {file.name} =====\n{text}")
-                        for idx, chunk in enumerate(doc_chunks, start=1):
-                            all_chunks.append({"doc_name": file.name, "chunk_id": idx, "text": chunk})
-                    else:
-                        doc_entry.update({"text_chars": 0, "chunks": 0})
-
-                    docs.append(doc_entry)
-
-            if not docs:
-                st.error("Aucun document exploitable trouvé.")
-            elif not pageindex_enabled and not all_chunks:
-                st.error("Aucun texte exploitable trouvé. Probable PDF scanné : il faut un OCR.")
-            else:
-                st.session_state.pdf_text = "\n\n".join(all_texts)
+            if docs:
                 st.session_state.documents = docs
-                st.session_state.chunks = all_chunks
-                st.session_state.pageindex_enabled = pageindex_enabled
-                st.session_state.pageindex_error = pageindex_error
-
-                mode_label = "PageIndex" if pageindex_enabled else "lexical"
-                st.success(
-                    f"OK. {len(docs)} document(s) indexé(s), "
-                    f"{len(all_chunks)} chunks fallback, mode actif: {mode_label}."
-                )
-                if pageindex_error:
-                    st.warning(pageindex_error)
+                st.session_state.chat = []
+                st.session_state.last_traces = []
+                st.success(f"OK. {len(docs)} document(s) indexé(s) avec PageIndex.")
 
     if st.session_state.documents:
-        with st.expander("Documents indexés", expanded=False):
+        with st.expander("Documents indexés", expanded=True):
             for doc in st.session_state.documents:
-                st.markdown(
-                    f"- **{doc['name']}** — mode `{doc.get('mode')}` — "
-                    f"{doc.get('chunks', 0)} chunks — {doc.get('text_chars', 0)} caractères"
-                )
-                if doc.get("doc_id"):
-                    st.caption(f"doc_id: {doc['doc_id']}")
+                metadata = doc.get("metadata") or {}
+                doc_type = metadata.get("doc_type") or metadata.get("type") or "document"
+                page_count = metadata.get("page_count")
+                line_count = metadata.get("line_count")
+                size_label = ""
+                if page_count:
+                    size_label = f" — {page_count} pages"
+                elif line_count:
+                    size_label = f" — {line_count} lignes"
+                st.markdown(f"- **{doc['name']}** — `{doc_type}`{size_label}")
+                st.caption(f"doc_id: {doc['doc_id']}")
 
-    if st.session_state.pdf_text:
-        with st.expander("Aperçu texte extrait", expanded=False):
-            st.text_area("Texte", st.session_state.pdf_text[:8000], height=260)
+        if show_traces and st.session_state.last_traces:
+            with st.expander("Derniers appels outils PageIndex", expanded=False):
+                st.json(st.session_state.last_traces)
 
 with col_right:
-    st.subheader("2) Chat")
+    st.subheader("2) Chat PageIndex")
 
     if not st.session_state.documents:
-        st.warning("Indexe d'abord les documents.")
+        st.warning("Indexe d'abord les documents avec PageIndex.")
     else:
         for message in st.session_state.chat:
             with st.chat_message(message["role"]):
@@ -723,112 +485,60 @@ with col_right:
             with st.chat_message("user"):
                 st.markdown(question)
 
-            context = ""
             traces: List[dict] = []
-            active_mode = "lexical"
-
-            try:
-                if retrieval_mode == "pageindex" and st.session_state.pageindex_enabled:
-                    pageindex_client = get_pageindex_client(workspace)
-                    pageindex_collection = get_pageindex_collection(pageindex_client)
-                    pageindex_docs = [doc for doc in st.session_state.documents if doc.get("doc_id")]
-                    context, traces = build_pageindex_context(
-                        client=pageindex_collection,
-                        question=question,
-                        documents=pageindex_docs,
-                        llm_kwargs=llm_kwargs,
-                        max_docs=pageindex_max_docs,
-                        default_pages=pageindex_default_pages,
-                        max_structure_chars=max_structure_chars,
-                        max_context_chars=max_context_chars,
-                    )
-
-                    lexical_context, lexical_traces = build_matched_lexical_context(
-                        question,
-                        st.session_state.chunks,
-                        k=k,
-                        mode="pageindex_lexical_supplement",
-                    )
-                    if lexical_context:
-                        context = append_context_part(
-                            context,
-                            "[COMPLÉMENT LEXICAL — autres occurrences possibles]\n" + lexical_context,
-                            max_context_chars,
-                        )
-                        traces.extend(lexical_traces)
-
-                    active_mode = "pageindex+lexical" if lexical_context else "pageindex"
-                else:
-                    context, traces = build_lexical_context(question, st.session_state.chunks, k=k)
-            except Exception as exc:
-                st.warning(f"PageIndex indisponible pour cette question, fallback lexical: {exc}")
-                context, traces = build_lexical_context(question, st.session_state.chunks, k=k)
-                active_mode = "lexical"
-
-            if show_context:
-                with st.expander(f"Contexte injecté ({active_mode})", expanded=False):
-                    st.json(traces)
-                    st.code(context[:30000])
-
-            system = (
-                "Tu es un assistant documentaire. Réponds uniquement à partir du CONTEXTE fourni. "
-                "Si le contexte ne contient pas la réponse, dis-le clairement. "
-                "Quand la question demande une liste, un décompte ou plusieurs éléments, "
-                "parcours tout le contexte et restitue tous les éléments distincts trouvés. "
-                "Réponds en français, de façon concise, factuelle et utile."
-            )
-            user_prompt = f"""CONTEXTE:
-{context}
-
-QUESTION:
-{question}
-
-Réponse attendue : concise, sourcée par le contexte, sans invention."""
+            doc_ids = [doc["doc_id"] for doc in st.session_state.documents if doc.get("doc_id")]
 
             with st.chat_message("assistant"):
                 placeholder = st.empty()
                 answer = ""
-                try:
-                    for token in chat_stream(
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        **llm_kwargs,
-                    ):
-                        answer += token
-                        placeholder.markdown(answer)
-                except requests.exceptions.ConnectionError:
-                    st.error(f"Impossible de joindre Ollama ({ollama_host}).")
-                    answer = ""
-                except requests.HTTPError as exc:
-                    st.error(f"Erreur HTTP LLM: {exc}")
-                    answer = ""
-                except Exception as exc:
-                    st.error(f"Erreur LLM: {exc}")
-                    answer = ""
 
+                def append_delta(delta: str) -> None:
+                    nonlocal_answer["value"] += delta
+                    placeholder.markdown(nonlocal_answer["value"])
+
+                def append_trace(trace: dict) -> None:
+                    traces.append(trace)
+
+                nonlocal_answer = {"value": ""}
+                try:
+                    pageindex_client = get_pageindex_client(
+                        api_key=pageindex_api_key,
+                        model=pageindex_model,
+                        retrieve_model=pageindex_retrieve_model,
+                        storage_path=Path(storage_path_text),
+                        llm_api_key=llm_api_key,
+                        llm_base_url=llm_base_url,
+                        disable_tracing=disable_tracing,
+                    )
+                    pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
+                    answer = run_pageindex_query(
+                        collection=pageindex_collection,
+                        question=question,
+                        doc_ids=doc_ids,
+                        on_answer_delta=append_delta,
+                        on_trace=append_trace,
+                    )
+                    if answer and answer != nonlocal_answer["value"]:
+                        placeholder.markdown(answer)
+                    if any(trace.get("type") == "stream_error" for trace in traces):
+                        st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
+                except Exception as exc:
+                    answer = ""
+                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}")
+
+            st.session_state.last_traces = traces
             if answer.strip():
                 st.session_state.chat.append({"role": "assistant", "content": answer})
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
             if st.button("Vider le chat"):
                 st.session_state.chat = []
+                st.session_state.last_traces = []
                 st.rerun()
         with c2:
-            if st.button("Réinitialiser PDF + chat"):
-                st.session_state.pdf_text = ""
+            if st.button("Réinitialiser documents + chat"):
                 st.session_state.documents = []
-                st.session_state.chunks = []
                 st.session_state.chat = []
-                st.session_state.pageindex_enabled = False
-                st.session_state.pageindex_error = ""
+                st.session_state.last_traces = []
                 st.rerun()
-        with c3:
-            if st.session_state.pageindex_enabled:
-                st.caption("Retrieval: PageIndex vectorless")
-            else:
-                st.caption("Retrieval: fallback lexical")
