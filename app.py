@@ -77,11 +77,42 @@ def compact_text(value: Any, limit: int = 2_000) -> str:
     return text[:limit] + "\n... [sortie tronquée]"
 
 
-def get_pageindex_client(*, api_key: str, model: str, retrieve_model: str, storage_path: Path):
+def configure_llm_environment(*, llm_api_key: str, llm_base_url: str) -> Dict[str, str]:
+    """Expose the selected OpenAI-compatible endpoint to PageIndex/LiteLLM.
+
+    PageIndex local mode delegates model calls to LiteLLM/OpenAI-compatible
+    clients, which read their endpoint from environment variables. Set both
+    commonly used names so vLLM, LiteLLM proxy, Ollama OpenAI mode and OpenAI
+    SDK-compatible providers all receive the same base URL.
+    """
+    updates: Dict[str, str] = {}
+    api_key = llm_api_key.strip()
+    base_url = llm_base_url.strip().rstrip("/")
+
+    if api_key:
+        updates["OPENAI_API_KEY"] = api_key
+    if base_url:
+        updates["OPENAI_BASE_URL"] = base_url
+        updates["OPENAI_API_BASE"] = base_url
+
+    os.environ.update(updates)
+    return updates
+
+
+def get_pageindex_client(
+    *,
+    api_key: str,
+    model: str,
+    retrieve_model: str,
+    storage_path: Path,
+    llm_api_key: str,
+    llm_base_url: str,
+):
     kwargs: Dict[str, Any] = {}
     if api_key:
         kwargs["api_key"] = api_key
     else:
+        configure_llm_environment(llm_api_key=llm_api_key, llm_base_url=llm_base_url)
         storage_path.mkdir(parents=True, exist_ok=True)
         kwargs["storage_path"] = str(storage_path)
         if model:
@@ -182,6 +213,8 @@ default_api_key = os.getenv("PAGEINDEX_API_KEY", "")
 default_collection = os.getenv("PAGEINDEX_COLLECTION", "default")
 default_model = os.getenv("PAGEINDEX_MODEL", "")
 default_retrieve_model = os.getenv("PAGEINDEX_RETRIEVE_MODEL", default_model)
+default_llm_api_key = os.getenv("OPENAI_API_KEY", "")
+default_llm_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 
 with st.sidebar:
     st.header("PageIndex")
@@ -193,6 +226,21 @@ with st.sidebar:
     )
     collection_name = st.text_input("Collection", value=default_collection)
     storage_path_text = st.text_input("Storage local", value=str(workspace))
+
+    st.subheader("LLM local / OpenAI-compatible")
+    llm_api_key = st.text_input(
+        "OPENAI_API_KEY",
+        value=default_llm_api_key,
+        type="password",
+        help="Token envoyé au serveur LLM en mode local PageIndex.",
+        disabled=bool(pageindex_api_key),
+    )
+    llm_base_url = st.text_input(
+        "OPENAI_BASE_URL / OPENAI_API_BASE",
+        value=default_llm_base_url,
+        help="URL du serveur LLM OpenAI-compatible, par exemple https://api.openai.com/v1, http://localhost:8000/v1 ou http://localhost:11434/v1.",
+        disabled=bool(pageindex_api_key),
+    )
 
     st.subheader("Modèles locaux")
     pageindex_model = st.text_input(
@@ -245,6 +293,8 @@ with col_left:
                         model=pageindex_model,
                         retrieve_model=pageindex_retrieve_model,
                         storage_path=storage_path,
+                        llm_api_key=llm_api_key,
+                        llm_base_url=llm_base_url,
                     )
                     pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
 
@@ -328,6 +378,8 @@ with col_right:
                         model=pageindex_model,
                         retrieve_model=pageindex_retrieve_model,
                         storage_path=Path(storage_path_text),
+                        llm_api_key=llm_api_key,
+                        llm_base_url=llm_base_url,
                     )
                     pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
                     answer = run_pageindex_query(

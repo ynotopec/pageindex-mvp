@@ -1,4 +1,5 @@
 import ast
+import os
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,7 @@ HELPER_NAMES = {
     "compact_text",
     "_doc_name_from_metadata",
     "_doc_id_from_metadata",
+    "configure_llm_environment",
 }
 
 
@@ -21,9 +23,10 @@ def load_helpers():
         body=[
             ast.Import(names=[ast.alias(name="hashlib")]),
             ast.Import(names=[ast.alias(name="json")]),
+            ast.Import(names=[ast.alias(name="os")]),
             ast.Import(names=[ast.alias(name="re")]),
             ast.ImportFrom(module="pathlib", names=[ast.alias(name="Path")], level=0),
-            ast.ImportFrom(module="typing", names=[ast.alias(name="Any"), ast.alias(name="Optional")], level=0),
+            ast.ImportFrom(module="typing", names=[ast.alias(name="Any"), ast.alias(name="Dict"), ast.alias(name="Optional")], level=0),
             *selected,
         ],
         type_ignores=[],
@@ -67,6 +70,26 @@ class PageIndexHelperTests(unittest.TestCase):
         text = helpers["compact_text"]("abcdef", limit=3)
 
         self.assertEqual(text, "abc\n... [sortie tronquée]")
+
+    def test_configure_llm_environment_sets_base_url_aliases(self):
+        helpers = load_helpers()
+        original = {key: os.environ.get(key) for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE")}
+        try:
+            updates = helpers["configure_llm_environment"](
+                llm_api_key="sk-test",
+                llm_base_url="http://localhost:8000/v1/",
+            )
+
+            self.assertEqual(updates["OPENAI_API_KEY"], "sk-test")
+            self.assertEqual(updates["OPENAI_BASE_URL"], "http://localhost:8000/v1")
+            self.assertEqual(updates["OPENAI_API_BASE"], "http://localhost:8000/v1")
+            self.assertEqual(os.environ["OPENAI_API_BASE"], "http://localhost:8000/v1")
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

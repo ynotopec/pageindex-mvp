@@ -46,9 +46,12 @@ PageIndex model. For OpenAI-compatible defaults, edit `.env`:
 
 ```bash
 OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
 PAGEINDEX_MODEL=gpt-4o-2024-11-20
 PAGEINDEX_RETRIEVE_MODEL=gpt-4o-2024-11-20
 ```
+
+Pour un serveur OpenAI-compatible local ou privé, modifie `OPENAI_BASE_URL`, par exemple `http://localhost:8000/v1` pour vLLM ou `http://localhost:11434/v1` pour Ollama en mode OpenAI. L’interface Streamlit expose aussi ce champ dans la sidebar; au runtime l’app renseigne `OPENAI_BASE_URL` et `OPENAI_API_BASE` pour PageIndex/LiteLLM.
 
 For PageIndex cloud mode:
 
