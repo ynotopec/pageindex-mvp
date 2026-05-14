@@ -1618,7 +1618,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "openai-agents", specifier = ">=0.2.0" },
+    { name = "openai-agents", extras = ["litellm"], specifier = ">=0.2.0" },
     { name = "pageindex", git = "https://github.com/VectifyAI/PageIndex.git?rev=dev" },
     { name = "streamlit", specifier = ">=1.30.0" },
 ]

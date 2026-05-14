@@ -127,10 +127,27 @@ def build_pageindex_error_message(*, stream_error: BaseException, retry_error: O
         message += f" Détail retry non-stream: {sanitize_error_text(retry_error)}"
     message += (
         " Vérifie OPENAI_BASE_URL/OPENAI_API_BASE, OPENAI_API_KEY, PAGEINDEX_MODEL "
-        "et PAGEINDEX_RETRIEVE_MODEL. Si LiteLLM affiche Provider List, ajoute un préfixe "
-        "provider au modèle (ex. openai/..., ollama_chat/..., vllm/...)."
+        "et PAGEINDEX_RETRIEVE_MODEL. Si LiteLLM affiche Provider List, utilise un modèle "
+        "préfixé litellm/provider/... (ex. litellm/openai/..., litellm/ollama_chat/..., "
+        "litellm/vllm/...)."
     )
     return message
+
+
+def normalize_litellm_model_name(model: str) -> str:
+    """Route local PageIndex models through the Agents SDK LiteLLM provider.
+
+    PageIndex passes the model string directly to OpenAI Agents. In that SDK,
+    provider-prefixed LiteLLM routing requires a top-level ``litellm/`` prefix
+    (for example ``litellm/openai/gpt-4o-mini`` or
+    ``litellm/ollama_chat/llama3.1``). Without it, ``openai/...`` uses the
+    default OpenAI provider/Responses path, which often fails against local
+    OpenAI-compatible servers.
+    """
+    value = model.strip()
+    if not value or value.startswith(("litellm/", "any-llm/")):
+        return value
+    return f"litellm/{value}"
 
 def configure_llm_environment(
     *,
@@ -184,9 +201,9 @@ def get_pageindex_client(
         storage_path.mkdir(parents=True, exist_ok=True)
         kwargs["storage_path"] = str(storage_path)
         if model:
-            kwargs["model"] = model
+            kwargs["model"] = normalize_litellm_model_name(model)
         if retrieve_model:
-            kwargs["retrieve_model"] = retrieve_model
+            kwargs["retrieve_model"] = normalize_litellm_model_name(retrieve_model)
     return PageIndexClient(**kwargs)
 
 
@@ -350,13 +367,13 @@ with st.sidebar:
     pageindex_model = st.text_input(
         "PAGEINDEX_MODEL",
         value=default_model,
-        help="Modèle utilisé pour construire l'index en mode local. Utilise le préfixe LiteLLM/provider si nécessaire, ex. openai/gpt-4o-mini, ollama_chat/llama3.1, vllm/<model>.",
+        help="Modèle LiteLLM utilisé pour construire l'index. L'app ajoute litellm/ si absent; exemples: openai/gpt-4o-mini, ollama_chat/llama3.1, vllm/<model>.",
         disabled=bool(pageindex_api_key),
     )
     pageindex_retrieve_model = st.text_input(
         "PAGEINDEX_RETRIEVE_MODEL",
         value=default_retrieve_model,
-        help="Modèle agentique utilisé par collection.query(...). Utilise le préfixe provider LiteLLM si ton serveur n'est pas OpenAI natif.",
+        help="Modèle agentique utilisé par collection.query(...). L'app force le routage OpenAI Agents via LiteLLM avec le préfixe litellm/.",
         disabled=bool(pageindex_api_key),
     )
 

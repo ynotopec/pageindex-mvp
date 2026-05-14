@@ -5,7 +5,7 @@ description = "Minimal document Q&A Streamlit app using VectifyAI/PageIndex Coll
 requires-python = ">=3.10"
 dependencies = [
   "streamlit>=1.30.0",
-  "openai-agents>=0.2.0",
+  "openai-agents[litellm]>=0.2.0",
   "pageindex @ git+https://github.com/VectifyAI/PageIndex.git@dev",
 ]
 

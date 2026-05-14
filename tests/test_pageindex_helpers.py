@@ -18,6 +18,7 @@ HELPER_NAMES = {
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
     "run_pageindex_query_non_stream",
+    "normalize_litellm_model_name",
 }
 
 
@@ -183,6 +184,23 @@ class PageIndexHelperTests(unittest.TestCase):
                 )
 
         asyncio.run(call_helper())
+
+    def test_normalize_litellm_model_name_adds_agents_prefix(self):
+        helpers = load_helpers()
+
+        self.assertEqual(
+            helpers["normalize_litellm_model_name"]("openai/gpt-4o-mini"),
+            "litellm/openai/gpt-4o-mini",
+        )
+        self.assertEqual(
+            helpers["normalize_litellm_model_name"]("ollama_chat/llama3.1"),
+            "litellm/ollama_chat/llama3.1",
+        )
+        self.assertEqual(
+            helpers["normalize_litellm_model_name"]("litellm/vllm/model"),
+            "litellm/vllm/model",
+        )
+        self.assertEqual(helpers["normalize_litellm_model_name"](""), "")
 
 
 if __name__ == "__main__":
