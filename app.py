@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -84,6 +85,52 @@ def compact_text(value: Any, limit: int = 2_000) -> str:
         return text
     return text[:limit] + "\n... [sortie tronquée]"
 
+
+
+def sanitize_error_text(value: Any) -> str:
+    """Return a UI-safe error message without leaking API keys."""
+    text = pageindex_value_to_text(value).strip()
+    if not text:
+        return "Erreur inconnue."
+
+    text = re.sub(
+        r"(?i)(api key(?: provided)?\s*[:=]\s*)[^\s,}\]]+",
+        r"\1[redacted]",
+        text,
+    )
+    text = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "sk-[redacted]", text)
+    return text
+
+
+def pageindex_query_result_to_text(result: Any) -> str:
+    """Extract answer text from non-streaming PageIndex query responses."""
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, dict):
+        for key in ("answer", "content", "text", "response", "result"):
+            value = result.get(key)
+            if value:
+                return pageindex_value_to_text(value).strip()
+    for attr in ("answer", "content", "text", "response", "result"):
+        value = getattr(result, attr, None)
+        if value:
+            return pageindex_value_to_text(value).strip()
+    return pageindex_value_to_text(result).strip()
+
+
+def build_pageindex_error_message(*, stream_error: BaseException, retry_error: Optional[BaseException] = None) -> str:
+    message = "Le streaming PageIndex a échoué."
+    message += f" Détail streaming: {sanitize_error_text(stream_error)}"
+    if retry_error is not None:
+        message += f" Détail retry non-stream: {sanitize_error_text(retry_error)}"
+    message += (
+        " Vérifie OPENAI_BASE_URL/OPENAI_API_BASE, OPENAI_API_KEY, PAGEINDEX_MODEL "
+        "et PAGEINDEX_RETRIEVE_MODEL. Si LiteLLM affiche Provider List, ajoute un préfixe "
+        "provider au modèle (ex. openai/..., ollama_chat/..., vllm/...)."
+    )
+    return message
 
 def configure_llm_environment(
     *,
@@ -189,29 +236,47 @@ def run_pageindex_query(
     on_answer_delta: Callable[[str], None],
     on_trace: Callable[[dict], None],
 ) -> str:
-    """Run the PageIndex agentic query stream from synchronous Streamlit code."""
+    """Run PageIndex query with streaming, then retry PageIndex non-stream on stream failure."""
 
     async def consume_stream() -> str:
         final_answer_parts: List[str] = []
         final_answer = ""
-        stream = collection.query(question, doc_ids=doc_ids or None, stream=True)
-        async for event in stream:
-            event_type = getattr(event, "type", "")
-            data = getattr(event, "data", None)
-            if event_type == "answer_delta":
-                delta = str(data or "")
-                final_answer_parts.append(delta)
-                on_answer_delta(delta)
-            elif event_type == "answer_done":
-                final_answer = str(data or "")
-            elif event_type in {"reasoning", "tool_call", "tool_result"}:
-                trace = {"type": event_type}
-                if event_type == "tool_result":
-                    trace["data"] = compact_text(data)
-                else:
-                    trace["data"] = data
-                on_trace(trace)
-        return final_answer or "".join(final_answer_parts)
+        try:
+            stream = collection.query(question, doc_ids=doc_ids or None, stream=True)
+            async for event in stream:
+                event_type = getattr(event, "type", "")
+                data = getattr(event, "data", None)
+                if event_type == "answer_delta":
+                    delta = str(data or "")
+                    final_answer_parts.append(delta)
+                    on_answer_delta(delta)
+                elif event_type == "answer_done":
+                    final_answer = str(data or "")
+                elif event_type in {"reasoning", "tool_call", "tool_result"}:
+                    trace = {"type": event_type}
+                    if event_type == "tool_result":
+                        trace["data"] = compact_text(data)
+                    else:
+                        trace["data"] = data
+                    on_trace(trace)
+                elif event_type in {"error", "exception"}:
+                    raise RuntimeError(sanitize_error_text(data))
+            return final_answer or "".join(final_answer_parts)
+        except Exception as stream_exc:
+            on_trace({"type": "stream_error", "data": sanitize_error_text(stream_exc)})
+            try:
+                retry_result = collection.query(question, doc_ids=doc_ids or None, stream=False)
+                if inspect.isawaitable(retry_result):
+                    retry_result = await retry_result
+                retry_answer = pageindex_query_result_to_text(retry_result)
+                if retry_answer:
+                    on_trace({"type": "non_stream_retry", "data": "Réponse récupérée après échec du streaming."})
+                    return retry_answer
+                raise RuntimeError("Le retry PageIndex non-stream n'a retourné aucune réponse.")
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    build_pageindex_error_message(stream_error=stream_exc, retry_error=retry_exc)
+                ) from retry_exc
 
     try:
         asyncio.get_running_loop()
@@ -421,9 +486,11 @@ with col_right:
                     )
                     if answer and answer != nonlocal_answer["value"]:
                         placeholder.markdown(answer)
+                    if any(trace.get("type") == "stream_error" for trace in traces):
+                        st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
                 except Exception as exc:
                     answer = ""
-                    st.error(f"Erreur PageIndex : {exc}")
+                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}")
 
             st.session_state.last_traces = traces
             if answer.strip():

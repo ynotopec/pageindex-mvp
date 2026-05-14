@@ -12,6 +12,9 @@ HELPER_NAMES = {
     "_doc_name_from_metadata",
     "_doc_id_from_metadata",
     "configure_llm_environment",
+    "sanitize_error_text",
+    "pageindex_query_result_to_text",
+    "build_pageindex_error_message",
 }
 
 
@@ -119,6 +122,27 @@ class PageIndexHelperTests(unittest.TestCase):
                 os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
             else:
                 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = original
+
+    def test_sanitize_error_text_redacts_api_keys(self):
+        helpers = load_helpers()
+
+        text = helpers["sanitize_error_text"]("Incorrect API key provided: sk-secret123456")
+
+        self.assertIn("[redacted]", text)
+        self.assertNotIn("sk-secret123456", text)
+
+    def test_pageindex_query_result_to_text_extracts_answer_shapes(self):
+        helpers = load_helpers()
+
+        self.assertEqual(helpers["pageindex_query_result_to_text"]({"answer": "Bonjour"}), "Bonjour")
+
+    def test_build_pageindex_error_message_includes_provider_hint(self):
+        helpers = load_helpers()
+
+        text = helpers["build_pageindex_error_message"](stream_error=RuntimeError("Internal Server Error"))
+
+        self.assertIn("OPENAI_BASE_URL", text)
+        self.assertIn("Provider List", text)
 
 
 if __name__ == "__main__":
