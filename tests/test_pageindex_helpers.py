@@ -18,8 +18,9 @@ HELPER_NAMES = {
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
     "run_pageindex_query_non_stream",
-    "normalize_litellm_model_name",
+    "normalize_retrieve_model_name",
     "build_pageindex_query_prompt",
+    "build_index_config",
     "_run_pageindex_query_non_stream_any_context",
     "run_pageindex_query",
 }
@@ -45,7 +46,22 @@ def load_helpers():
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
-    namespace = {"set_tracing_disabled": lambda disabled: None}
+    class FakeIndexConfig:
+        def __init__(self, **kwargs):
+            defaults = {
+                "toc_check_page_num": 20,
+                "max_page_num_each_node": 10,
+                "max_token_num_each_node": 20000,
+                "if_add_node_id": True,
+                "if_add_node_summary": True,
+                "if_add_doc_description": True,
+                "if_add_node_text": False,
+            }
+            defaults.update(kwargs)
+            for key, value in defaults.items():
+                setattr(self, key, value)
+
+    namespace = {"set_tracing_disabled": lambda disabled: None, "IndexConfig": FakeIndexConfig}
     exec(compile(module, str(source), "exec"), namespace)
     return namespace
 
@@ -221,23 +237,44 @@ class PageIndexHelperTests(unittest.TestCase):
         self.assertEqual(answer, "Réponse directe")
         self.assertEqual(traces[0]["type"], "non_stream")
 
-    def test_normalize_litellm_model_name_adds_agents_prefix(self):
+    def test_normalize_retrieve_model_name_matches_pageindex_dev(self):
         helpers = load_helpers()
 
         self.assertEqual(
-            helpers["normalize_litellm_model_name"]("openai/gpt-4o-mini"),
+            helpers["normalize_retrieve_model_name"]("openai/gpt-4o-mini"),
             "openai/gpt-4o-mini",
         )
         self.assertEqual(
-            helpers["normalize_litellm_model_name"]("ollama_chat/llama3.1"),
+            helpers["normalize_retrieve_model_name"]("ollama_chat/llama3.1"),
             "litellm/ollama_chat/llama3.1",
         )
         self.assertEqual(
-            helpers["normalize_litellm_model_name"]("litellm/vllm/model"),
+            helpers["normalize_retrieve_model_name"]("litellm/vllm/model"),
             "litellm/vllm/model",
         )
-        self.assertEqual(helpers["normalize_litellm_model_name"]("gpt-4o-mini"), "gpt-4o-mini")
-        self.assertEqual(helpers["normalize_litellm_model_name"](""), "")
+        self.assertEqual(helpers["normalize_retrieve_model_name"]("gpt-4o-mini"), "gpt-4o-mini")
+        self.assertEqual(helpers["normalize_retrieve_model_name"](""), "")
+
+    def test_build_index_config_uses_pageindex_dev_fields(self):
+        helpers = load_helpers()
+
+        config = helpers["build_index_config"](
+            toc_check_page_num=30,
+            max_page_num_each_node=8,
+            max_token_num_each_node=12000,
+            if_add_node_id=True,
+            if_add_node_summary=False,
+            if_add_doc_description=True,
+            if_add_node_text=False,
+        )
+
+        self.assertEqual(config.toc_check_page_num, 30)
+        self.assertEqual(config.max_page_num_each_node, 8)
+        self.assertEqual(config.max_token_num_each_node, 12000)
+        self.assertTrue(config.if_add_node_id)
+        self.assertFalse(config.if_add_node_summary)
+        self.assertTrue(config.if_add_doc_description)
+        self.assertFalse(config.if_add_node_text)
 
 
 if __name__ == "__main__":

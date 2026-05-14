@@ -53,11 +53,13 @@ PAGEINDEX_RETRIEVE_MODEL=openai/gpt-4o-mini
 PAGEINDEX_STREAMING=false
 ```
 
-Pour un serveur OpenAI-compatible local ou privé, modifie `OPENAI_BASE_URL`, par exemple `http://localhost:8000/v1` pour vLLM ou `http://localhost:11434/v1` pour Ollama en mode OpenAI. L’interface Streamlit expose aussi ce champ dans la sidebar; au runtime l’app renseigne `OPENAI_BASE_URL` et `OPENAI_API_BASE` pour PageIndex/LiteLLM. L’app suit la normalisation de PageIndex `dev` : les modèles simples (`gpt-4o-mini`) et `openai/...` restent inchangés, `litellm/...` reste inchangé, et les autres chemins provider (`ollama_chat/...`, `vllm/...`) reçoivent automatiquement le préfixe `litellm/`.
+Pour un serveur OpenAI-compatible local ou privé, modifie `OPENAI_BASE_URL`, par exemple `http://localhost:8000/v1` pour vLLM ou `http://localhost:11434/v1` pour Ollama en mode OpenAI. L’interface Streamlit expose aussi ce champ dans la sidebar; au runtime l’app renseigne `OPENAI_BASE_URL` et `OPENAI_API_BASE` pour PageIndex/LiteLLM. L’app suit la normalisation de PageIndex `dev` : `PAGEINDEX_MODEL` est passé tel quel à PageIndex/LiteLLM pour l’indexation, tandis que `PAGEINDEX_RETRIEVE_MODEL` est normalisé comme le modèle agentique officiel (`gpt-4o-mini`, `openai/...` et `litellm/...` restent inchangés; les autres chemins provider comme `ollama_chat/...` ou `vllm/...` reçoivent automatiquement le préfixe `litellm/`).
 
 `OPENAI_AGENTS_DISABLE_TRACING=1` est recommandé par défaut avec les serveurs locaux ou clés non-OpenAI : cela évite que l’OpenAI Agents SDK tente d’exporter des traces vers OpenAI et produise une erreur 401 non fatale.
 
 `PAGEINDEX_STREAMING=false` est recommandé si la réponse est très lente ou si ton endpoint local ne supporte pas bien le streaming PageIndex : l’app fait alors directement un seul appel non-streaming au lieu d’essayer le streaming puis un retry. Tu peux l’activer dans la sidebar quand le streaming fonctionne correctement.
+
+La sidebar expose aussi les champs officiels de `pageindex.config.IndexConfig` en mode local : `toc_check_page_num`, `max_page_num_each_node`, `max_token_num_each_node`, `if_add_node_id`, `if_add_node_summary`, `if_add_doc_description` et `if_add_node_text`. Les variables `.env` équivalentes sont préfixées `PAGEINDEX_` dans `.env.example`.
 
 À chaque question, l’app entoure la demande utilisateur avec des consignes PageIndex inspirées de l’exemple officiel : vérifier les métadonnées, explorer la structure, récupérer uniquement des plages page/ligne serrées et répondre seulement depuis le contenu récupéré. Cela vise à améliorer la pertinence sans réintroduire de chunks locaux ni de fallback lexical.
 

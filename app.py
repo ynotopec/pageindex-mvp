@@ -32,6 +32,7 @@ os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 from agents import set_tracing_disabled
 import streamlit as st
 from pageindex import PageIndexClient  # type: ignore
+from pageindex.config import IndexConfig  # type: ignore
 
 set_tracing_disabled(os.getenv("OPENAI_AGENTS_DISABLE_TRACING", "1").strip().lower() in {"1", "true", "yes", "y", "on"})
 
@@ -134,13 +135,14 @@ def build_pageindex_error_message(*, stream_error: BaseException, retry_error: O
     return message
 
 
-def normalize_litellm_model_name(model: str) -> str:
-    """Normalize model names the same way PageIndex ``dev`` does.
+def normalize_retrieve_model_name(model: str) -> str:
+    """Normalize retrieval model names the same way PageIndex ``dev`` does.
 
-    PageIndex validates the indexing model with LiteLLM, then normalizes the
-    retrieval model internally: plain model names such as ``gpt-4o-mini`` stay
-    plain, ``openai/...`` and ``litellm/...`` are preserved, and other
-    provider paths are routed through the Agents SDK LiteLLM provider.
+    PageIndex passes the indexing model to LiteLLM as-is for provider
+    validation, then normalizes only the agent QA model: plain model names such
+    as ``gpt-4o-mini`` stay plain, ``openai/...`` and ``litellm/...`` are
+    preserved, and other provider paths are routed through the Agents SDK
+    LiteLLM provider.
     """
     value = model.strip()
     passthrough_prefixes = ("litellm/", "openai/")
@@ -203,6 +205,7 @@ def get_pageindex_client(
     llm_api_key: str,
     llm_base_url: str,
     disable_tracing: bool,
+    index_config: Optional[IndexConfig] = None,
 ):
     kwargs: Dict[str, Any] = {}
     if api_key:
@@ -215,15 +218,39 @@ def get_pageindex_client(
         )
         storage_path.mkdir(parents=True, exist_ok=True)
         kwargs["storage_path"] = str(storage_path)
+        if index_config is not None:
+            kwargs["index_config"] = index_config
         if model:
-            kwargs["model"] = normalize_litellm_model_name(model)
+            kwargs["model"] = model.strip()
         if retrieve_model:
-            kwargs["retrieve_model"] = normalize_litellm_model_name(retrieve_model)
+            kwargs["retrieve_model"] = normalize_retrieve_model_name(retrieve_model)
     return PageIndexClient(**kwargs)
 
 
 def get_pageindex_collection(client: Any, collection_name: str):
     return client.collection(collection_name)
+
+
+def build_index_config(
+    *,
+    toc_check_page_num: int,
+    max_page_num_each_node: int,
+    max_token_num_each_node: int,
+    if_add_node_id: bool,
+    if_add_node_summary: bool,
+    if_add_doc_description: bool,
+    if_add_node_text: bool,
+) -> IndexConfig:
+    """Build PageIndex's official local indexing configuration."""
+    return IndexConfig(
+        toc_check_page_num=toc_check_page_num,
+        max_page_num_each_node=max_page_num_each_node,
+        max_token_num_each_node=max_token_num_each_node,
+        if_add_node_id=if_add_node_id,
+        if_add_node_summary=if_add_node_summary,
+        if_add_doc_description=if_add_doc_description,
+        if_add_node_text=if_add_node_text,
+    )
 
 
 def _doc_name_from_metadata(doc: dict) -> str:
@@ -408,15 +435,60 @@ with st.sidebar:
     pageindex_model = st.text_input(
         "PAGEINDEX_MODEL",
         value=default_model,
-        help="Modèle LiteLLM utilisé pour construire l'index. L'app ajoute litellm/ si absent; exemples: openai/gpt-4o-mini, ollama_chat/llama3.1, vllm/<model>.",
+        help="Modèle LiteLLM utilisé pour construire l'index. Comme PageIndex dev, il est transmis tel quel; exemples: openai/gpt-4o-mini, ollama_chat/llama3.1, vllm/<model>.",
         disabled=bool(pageindex_api_key),
     )
     pageindex_retrieve_model = st.text_input(
         "PAGEINDEX_RETRIEVE_MODEL",
         value=default_retrieve_model,
-        help="Modèle agentique utilisé par collection.query(...). L'app force le routage OpenAI Agents via LiteLLM avec le préfixe litellm/.",
+        help="Modèle agentique utilisé par collection.query(...). Comme PageIndex dev, l'app ajoute litellm/ seulement aux chemins provider/model non OpenAI.",
         disabled=bool(pageindex_api_key),
     )
+
+    with st.expander("IndexConfig PageIndex local", expanded=False):
+        st.caption("Paramètres officiels de pageindex.config.IndexConfig, utilisés uniquement en mode local.")
+        toc_check_page_num = st.number_input(
+            "toc_check_page_num",
+            min_value=0,
+            value=int(os.getenv("PAGEINDEX_TOC_CHECK_PAGE_NUM", "20")),
+            step=1,
+            disabled=bool(pageindex_api_key),
+        )
+        max_page_num_each_node = st.number_input(
+            "max_page_num_each_node",
+            min_value=1,
+            value=int(os.getenv("PAGEINDEX_MAX_PAGE_NUM_EACH_NODE", "10")),
+            step=1,
+            disabled=bool(pageindex_api_key),
+        )
+        max_token_num_each_node = st.number_input(
+            "max_token_num_each_node",
+            min_value=1,
+            value=int(os.getenv("PAGEINDEX_MAX_TOKEN_NUM_EACH_NODE", "20000")),
+            step=1000,
+            disabled=bool(pageindex_api_key),
+        )
+        if_add_node_id = st.checkbox(
+            "if_add_node_id",
+            value=env_bool("PAGEINDEX_IF_ADD_NODE_ID", True),
+            disabled=bool(pageindex_api_key),
+        )
+        if_add_node_summary = st.checkbox(
+            "if_add_node_summary",
+            value=env_bool("PAGEINDEX_IF_ADD_NODE_SUMMARY", True),
+            disabled=bool(pageindex_api_key),
+        )
+        if_add_doc_description = st.checkbox(
+            "if_add_doc_description",
+            value=env_bool("PAGEINDEX_IF_ADD_DOC_DESCRIPTION", True),
+            disabled=bool(pageindex_api_key),
+        )
+        if_add_node_text = st.checkbox(
+            "if_add_node_text",
+            value=env_bool("PAGEINDEX_IF_ADD_NODE_TEXT", False),
+            help="Option avancée PageIndex; peut augmenter fortement la taille stockée.",
+            disabled=bool(pageindex_api_key),
+        )
 
     disable_tracing = st.checkbox(
         "Désactiver tracing OpenAI Agents",
@@ -440,6 +512,16 @@ uploaded_files = st.file_uploader(
     "Upload un ou plusieurs documents",
     type=["pdf", "md", "markdown"],
     accept_multiple_files=True,
+)
+
+local_index_config = build_index_config(
+    toc_check_page_num=int(toc_check_page_num),
+    max_page_num_each_node=int(max_page_num_each_node),
+    max_token_num_each_node=int(max_token_num_each_node),
+    if_add_node_id=if_add_node_id,
+    if_add_node_summary=if_add_node_summary,
+    if_add_doc_description=if_add_doc_description,
+    if_add_node_text=if_add_node_text,
 )
 
 for key, default in {
@@ -473,6 +555,7 @@ with col_left:
                         llm_api_key=llm_api_key,
                         llm_base_url=llm_base_url,
                         disable_tracing=disable_tracing,
+                        index_config=local_index_config,
                     )
                     pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
 
@@ -559,6 +642,7 @@ with col_right:
                         llm_api_key=llm_api_key,
                         llm_base_url=llm_base_url,
                         disable_tracing=disable_tracing,
+                        index_config=local_index_config,
                     )
                     pageindex_collection = get_pageindex_collection(pageindex_client, collection_name)
                     answer = run_pageindex_query(
