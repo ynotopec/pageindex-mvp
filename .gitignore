@@ -1,37 +1,31 @@
-# Environment variables
+# Secrets and local configuration
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-env/
-ENV/
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
 *.egg-info/
 
-# Git
-*.swp
-*.swo
-*~
+# Virtual environments
+.venv/
+venv/
+.envrc
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS/editor
 .DS_Store
-.git/
-
-# IDE
-.vscode/
 .idea/
-*.sublime-*
-
-# IDEs
-*.iml
-*.ipr
-*.iws
-
-# Logs
-*.log
-logs/
-
-# Cache
-.cache/
+.vscode/
+*.swp
