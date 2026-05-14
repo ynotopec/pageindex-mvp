@@ -19,6 +19,9 @@ HELPER_NAMES = {
     "build_pageindex_error_message",
     "run_pageindex_query_non_stream",
     "normalize_litellm_model_name",
+    "build_pageindex_query_prompt",
+    "_run_pageindex_query_non_stream_any_context",
+    "run_pageindex_query",
 }
 
 
@@ -34,8 +37,9 @@ def load_helpers():
             ast.Import(names=[ast.alias(name="json")]),
             ast.Import(names=[ast.alias(name="os")]),
             ast.Import(names=[ast.alias(name="re")]),
+            ast.Import(names=[ast.alias(name="concurrent.futures")]),
             ast.ImportFrom(module="pathlib", names=[ast.alias(name="Path")], level=0),
-            ast.ImportFrom(module="typing", names=[ast.alias(name="Any"), ast.alias(name="Dict"), ast.alias(name="List"), ast.alias(name="Optional")], level=0),
+            ast.ImportFrom(module="typing", names=[ast.alias(name="Any"), ast.alias(name="Callable"), ast.alias(name="Dict"), ast.alias(name="List"), ast.alias(name="Optional")], level=0),
             *selected,
         ],
         type_ignores=[],
@@ -185,12 +189,44 @@ class PageIndexHelperTests(unittest.TestCase):
 
         asyncio.run(call_helper())
 
+    def test_build_pageindex_query_prompt_enforces_tight_pageindex_retrieval(self):
+        helpers = load_helpers()
+
+        text = helpers["build_pageindex_query_prompt"]("Quel est le revenu ?")
+
+        self.assertIn("Question utilisateur : Quel est le revenu ?", text)
+        self.assertIn("plages serrées", text)
+        self.assertIn("exclusivement sur le contenu récupéré", text)
+
+    def test_run_pageindex_query_can_skip_streaming(self):
+        helpers = load_helpers()
+
+        class FakeCollection:
+            def query(self, question, doc_ids=None, stream=False):
+                self.question = question
+                self.doc_ids = doc_ids
+                self.stream = stream
+                return "Réponse directe"
+
+        traces = []
+        answer = helpers["run_pageindex_query"](
+            collection=FakeCollection(),
+            question="Question ?",
+            doc_ids=["doc-1"],
+            on_answer_delta=lambda delta: None,
+            on_trace=traces.append,
+            prefer_stream=False,
+        )
+
+        self.assertEqual(answer, "Réponse directe")
+        self.assertEqual(traces[0]["type"], "non_stream")
+
     def test_normalize_litellm_model_name_adds_agents_prefix(self):
         helpers = load_helpers()
 
         self.assertEqual(
             helpers["normalize_litellm_model_name"]("openai/gpt-4o-mini"),
-            "litellm/openai/gpt-4o-mini",
+            "openai/gpt-4o-mini",
         )
         self.assertEqual(
             helpers["normalize_litellm_model_name"]("ollama_chat/llama3.1"),
@@ -200,6 +236,7 @@ class PageIndexHelperTests(unittest.TestCase):
             helpers["normalize_litellm_model_name"]("litellm/vllm/model"),
             "litellm/vllm/model",
         )
+        self.assertEqual(helpers["normalize_litellm_model_name"]("gpt-4o-mini"), "gpt-4o-mini")
         self.assertEqual(helpers["normalize_litellm_model_name"](""), "")
 
 
