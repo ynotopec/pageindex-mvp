@@ -1,6 +1,17 @@
 # pageindex-mvp
 
-Minimal Streamlit app for PDF question-answering. Upload one or more PDFs, build a simple lexical index, then ask questions using either a local Ollama model or the popular OpenAI-compatible Chat Completions API.
+Minimal Streamlit app for PDF question-answering. Upload one or more PDFs, build a PageIndex-inspired hierarchical document index, then ask questions using either a local Ollama model or the popular OpenAI-compatible Chat Completions API.
+
+## Retrieval approach
+
+The app now uses a lightweight PageIndex-inspired, vectorless RAG pipeline:
+
+- extracts PDF text page-by-page with PyMuPDF, with a pypdf fallback;
+- detects natural headings and numbered sections to build a table-of-contents-style tree;
+- retrieves section nodes with weighted title/summary/text scoring instead of only fixed-size chunks;
+- injects document, section and page references into the LLM prompt for better traceability.
+
+This remains a local MVP, not the full VectifyAI/PageIndex implementation or cloud OCR pipeline.
 
 ## Requirements
 
