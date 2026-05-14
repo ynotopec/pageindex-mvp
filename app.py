@@ -131,22 +131,43 @@ def top_k_chunks(query: str, chunks: List[dict], k: int = 4) -> List[Tuple[int, 
     return [(score, item) for score, item in scored[:k] if score > 0]
 
 
-def build_lexical_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[dict]]:
+def build_matched_lexical_context(
+    question: str,
+    chunks: List[dict],
+    k: int,
+    *,
+    mode: str = "lexical",
+) -> Tuple[str, List[dict]]:
+    """Build context from the best lexical matches only.
+
+    This helper intentionally has no beginning-of-document fallback. It is used
+    both by the pure lexical retriever and as a complement to PageIndex, where
+    adding unrelated first pages can hide the actual repeated matches the user
+    asked about.
+    """
     selected = top_k_chunks(question, chunks, k=k)
-    if selected:
-        context = "\n\n".join(
-            f"[CHUNK score={score} doc={item['doc_name']} idx={item['chunk_id']}]\n{item['text']}"
-            for score, item in selected
-        )
-        traces = [
-            {
-                "mode": "lexical",
-                "doc": item["doc_name"],
-                "chunk": item["chunk_id"],
-                "score": score,
-            }
-            for score, item in selected
-        ]
+    if not selected:
+        return "", []
+
+    context = "\n\n".join(
+        f"[CHUNK score={score} doc={item['doc_name']} idx={item['chunk_id']}]\n{item['text']}"
+        for score, item in selected
+    )
+    traces = [
+        {
+            "mode": mode,
+            "doc": item["doc_name"],
+            "chunk": item["chunk_id"],
+            "score": score,
+        }
+        for score, item in selected
+    ]
+    return context, traces
+
+
+def build_lexical_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[dict]]:
+    context, traces = build_matched_lexical_context(question, chunks, k, mode="lexical")
+    if context:
         return context, traces
 
     fallback_items = chunks[:2]
@@ -164,6 +185,17 @@ def build_lexical_context(question: str, chunks: List[dict], k: int) -> Tuple[st
         for item in fallback_items
     ]
     return fallback_context, traces
+
+
+def append_context_part(base: str, addition: str, max_chars: int) -> str:
+    """Append a retrieval block while preserving the global context limit."""
+    if not addition.strip():
+        return base.strip()
+
+    combined = "\n\n".join(part for part in (base.strip(), addition.strip()) if part)
+    if len(combined) <= max_chars:
+        return combined
+    return combined[:max_chars] + "\n... [contexte tronqué]"
 
 
 # ----------------------------
@@ -710,7 +742,22 @@ with col_right:
                         max_structure_chars=max_structure_chars,
                         max_context_chars=max_context_chars,
                     )
-                    active_mode = "pageindex"
+
+                    lexical_context, lexical_traces = build_matched_lexical_context(
+                        question,
+                        st.session_state.chunks,
+                        k=k,
+                        mode="pageindex_lexical_supplement",
+                    )
+                    if lexical_context:
+                        context = append_context_part(
+                            context,
+                            "[COMPLÉMENT LEXICAL — autres occurrences possibles]\n" + lexical_context,
+                            max_context_chars,
+                        )
+                        traces.extend(lexical_traces)
+
+                    active_mode = "pageindex+lexical" if lexical_context else "pageindex"
                 else:
                     context, traces = build_lexical_context(question, st.session_state.chunks, k=k)
             except Exception as exc:
@@ -726,6 +773,8 @@ with col_right:
             system = (
                 "Tu es un assistant documentaire. Réponds uniquement à partir du CONTEXTE fourni. "
                 "Si le contexte ne contient pas la réponse, dis-le clairement. "
+                "Quand la question demande une liste, un décompte ou plusieurs éléments, "
+                "parcours tout le contexte et restitue tous les éléments distincts trouvés. "
                 "Réponds en français, de façon concise, factuelle et utile."
             )
             user_prompt = f"""CONTEXTE:
