@@ -1,53 +1,46 @@
 #!/usr/bin/env bash
-# Run with: source ./run.sh [IP] [PORT]
-# Also works from systemd ExecStart=/usr/bin/bash -lc '/path/to/run.sh 0.0.0.0 8501'
+set -euo pipefail
 
-_pageindex_run() {
-  set -Eeuo pipefail
+HOST="${1:-0.0.0.0}"
+PORT="${2:-8501}"
 
-  local server_address="${1:-${SERVER_NAME:-${STREAMLIT_SERVER_ADDRESS:-}}}"
-  local port_number="${2:-${SERVER_PORT:-${STREAMLIT_SERVER_PORT:-8501}}}"
-  local project_dir project_name venv_dir python_bin
+cd "$(dirname "$0")"
 
-  project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  project_name="$(basename "${project_dir}")"
-  venv_dir="${VENV_DIR:-${HOME}/venv/${project_name}}"
-  python_bin="${venv_dir}/bin/python"
+export PYTHONUNBUFFERED=1
 
-  cd "${project_dir}"
+echo "Starting pageindex-mvp"
+echo "Host: $HOST"
+echo "Port: $PORT"
+echo
 
-  if [ ! -x "${python_bin}" ]; then
-    "${project_dir}/install.sh"
-  fi
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: uv is not installed or not in PATH"
+  exit 1
+fi
 
-  # shellcheck disable=SC1091
-  source "${venv_dir}/bin/activate"
+echo "Python used by uv:"
+uv run python - <<'PY'
+import sys
+print(sys.executable)
+print(sys.version)
+PY
 
-  if [ -f "${project_dir}/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "${project_dir}/.env"
-    set +a
-  fi
+echo
+echo "Checking PageIndex import:"
+uv run python - <<'PY'
+try:
+    import pageindex
+    print("pageindex file:", pageindex.__file__)
+    from pageindex import PageIndexClient
+    print("PageIndexClient OK:", PageIndexClient)
+except Exception:
+    import traceback
+    traceback.print_exc()
+    raise SystemExit(1)
+PY
 
-  export HF_HUB_DISABLE_TELEMETRY="${HF_HUB_DISABLE_TELEMETRY:-1}"
-  export SERVER_NAME="${server_address}"
-  export SERVER_PORT="${port_number}"
-  export STREAMLIT_SERVER_ADDRESS="${server_address}"
-  export STREAMLIT_SERVER_PORT="${port_number}"
-
-  local args=(
-    -m streamlit run app.py
-    --browser.gatherUsageStats false
-    --server.port "${port_number}"
-  )
-
-  if [ -n "${server_address}" ]; then
-    args+=(--server.address "${server_address}")
-  fi
-
-  "${python_bin}" "${args[@]}"
-}
-
-_pageindex_run "$@"
-unset -f _pageindex_run
+echo
+echo "Starting Streamlit..."
+exec uv run streamlit run app.py \
+  --server.address "$HOST" \
+  --server.port "$PORT"

@@ -4,12 +4,10 @@ version = "0.1.0"
 description = "Minimal PDF Q&A Streamlit app with PageIndex, Ollama and OpenAI-compatible API providers."
 requires-python = ">=3.10"
 dependencies = [
-  "openai>=1.0.0",
+  "openai>=1.70.0",
   "pypdf>=4.0.0",
   "requests>=2.31.0",
   "streamlit>=1.30.0",
-
-  # PageIndex upstream, dev branch
   "pageindex @ git+https://github.com/VectifyAI/PageIndex.git@dev",
 ]
 

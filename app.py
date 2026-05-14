@@ -29,10 +29,13 @@ import streamlit as st
 from openai import OpenAI
 from pypdf import PdfReader
 
+PAGEINDEX_IMPORT_ERROR = None
+
 try:
     from pageindex import PageIndexClient  # type: ignore
-except Exception:
+except Exception as exc:
     PageIndexClient = None  # type: ignore
+    PAGEINDEX_IMPORT_ERROR = repr(exc)
 
 
 # ----------------------------
@@ -281,24 +284,63 @@ def write_uploaded_pdf(workspace: Path, file_name: str, data: bytes) -> Path:
 def get_pageindex_client(workspace: Path):
     if PageIndexClient is None:
         raise RuntimeError(
-            "PageIndex n'est pas installé. Installe VectifyAI/PageIndex ou utilise le mode lexical."
+            "PageIndex n'est pas installé/importable. "
+            f"Erreur import: {PAGEINDEX_IMPORT_ERROR}"
         )
+
     workspace.mkdir(parents=True, exist_ok=True)
-    return PageIndexClient(workspace=workspace)
+
+    # PageIndex dev attend storage_path=..., pas workspace=...
+    # PAGEINDEX_MODEL peut être utile si tu ne veux pas le modèle par défaut.
+    model = os.getenv("PAGEINDEX_MODEL") or None
+    retrieve_model = os.getenv("PAGEINDEX_RETRIEVE_MODEL") or None
+
+    return PageIndexClient(
+        model=model,
+        retrieve_model=retrieve_model,
+        storage_path=str(workspace),
+    )
 
 
-def find_cached_doc_id(client: Any, pdf_path: Path) -> Optional[str]:
-    for doc_id, doc in getattr(client, "documents", {}).items():
-        if doc.get("doc_name") == pdf_path.name:
-            return str(doc_id)
+def get_pageindex_collection(client: Any):
+    collection_name = os.getenv("PAGEINDEX_COLLECTION", "default")
+    return client.collection(collection_name)
+
+
+def _doc_name_from_metadata(doc: dict) -> str:
+    for key in ("doc_name", "name", "file_name", "filename", "title"):
+        value = doc.get(key)
+        if value:
+            return str(value)
+    path = doc.get("path") or doc.get("file_path") or doc.get("source")
+    if path:
+        return Path(str(path)).name
+    return ""
+
+
+def _doc_id_from_metadata(doc: dict) -> Optional[str]:
+    for key in ("doc_id", "id", "document_id"):
+        value = doc.get(key)
+        if value:
+            return str(value)
     return None
 
 
-def index_with_pageindex(client: Any, pdf_path: Path) -> str:
-    cached = find_cached_doc_id(client, pdf_path)
+def find_cached_doc_id(collection: Any, pdf_path: Path) -> Optional[str]:
+    try:
+        for doc in collection.list_documents():
+            if _doc_name_from_metadata(doc) == pdf_path.name:
+                return _doc_id_from_metadata(doc)
+    except Exception:
+        return None
+    return None
+
+
+def index_with_pageindex(collection: Any, pdf_path: Path) -> str:
+    cached = find_cached_doc_id(collection, pdf_path)
     if cached:
         return cached
-    return str(client.index(pdf_path))
+    return str(collection.add(str(pdf_path)))
 
 
 def compact_structure(structure: str, limit: int) -> str:
@@ -525,7 +567,11 @@ with col_left:
     st.subheader("1) Indexation")
 
     if PageIndexClient is None and retrieval_mode == "pageindex":
-        st.warning("PageIndex n'est pas importable. L'application utilisera le fallback lexical.")
+        st.warning(
+            "PageIndex n'est pas importable. "
+            f"Erreur: {PAGEINDEX_IMPORT_ERROR}. "
+            "Vérifie que Streamlit est lancé avec `uv run streamlit run app.py`."
+        )
 
     if not uploaded_files:
         st.info("Charge un ou plusieurs PDF pour commencer.")
@@ -537,11 +583,12 @@ with col_left:
             docs: List[dict] = []
             pageindex_error = ""
             pageindex_enabled = False
-            client = None
+            pageindex_collection = None
 
             if retrieval_mode == "pageindex" and PageIndexClient is not None:
                 try:
-                    client = get_pageindex_client(workspace)
+                    pageindex_client = get_pageindex_client(workspace)
+                    pageindex_collection = get_pageindex_collection(pageindex_client)
                 except Exception as exc:
                     pageindex_error = str(exc)
 
@@ -556,9 +603,9 @@ with col_left:
                         "mode": "lexical",
                     }
 
-                    if client is not None:
+                    if pageindex_collection is not None:
                         try:
-                            doc_id = index_with_pageindex(client, pdf_path)
+                            doc_id = index_with_pageindex(pageindex_collection, pdf_path)
                             doc_entry.update({"doc_id": doc_id, "mode": "pageindex"})
                             pageindex_enabled = True
                         except Exception as exc:
@@ -631,10 +678,11 @@ with col_right:
 
             try:
                 if retrieval_mode == "pageindex" and st.session_state.pageindex_enabled:
-                    client = get_pageindex_client(workspace)
+                    pageindex_client = get_pageindex_client(workspace)
+                    pageindex_collection = get_pageindex_collection(pageindex_client)
                     pageindex_docs = [doc for doc in st.session_state.documents if doc.get("doc_id")]
                     context, traces = build_pageindex_context(
-                        client=client,
+                        client=pageindex_collection,
                         question=question,
                         documents=pageindex_docs,
                         llm_kwargs=llm_kwargs,
