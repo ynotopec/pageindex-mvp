@@ -48,15 +48,20 @@ PageIndex model. For OpenAI-compatible defaults, edit `.env`:
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_AGENTS_DISABLE_TRACING=1
-PAGEINDEX_MODEL=litellm/openai/gpt-4o-mini
-PAGEINDEX_RETRIEVE_MODEL=litellm/openai/gpt-4o-mini
+PAGEINDEX_MODEL=openai/gpt-4o-mini
+PAGEINDEX_RETRIEVE_MODEL=openai/gpt-4o-mini
+PAGEINDEX_STREAMING=false
 ```
 
-Pour un serveur OpenAI-compatible local ou privé, modifie `OPENAI_BASE_URL`, par exemple `http://localhost:8000/v1` pour vLLM ou `http://localhost:11434/v1` pour Ollama en mode OpenAI. L’interface Streamlit expose aussi ce champ dans la sidebar; au runtime l’app renseigne `OPENAI_BASE_URL` et `OPENAI_API_BASE` pour PageIndex/LiteLLM. Si LiteLLM affiche `Provider List`, vérifie que `PAGEINDEX_MODEL` et `PAGEINDEX_RETRIEVE_MODEL` utilisent le préfixe OpenAI Agents `litellm/` suivi du provider LiteLLM (`litellm/openai/...`, `litellm/ollama_chat/...`, `litellm/vllm/...`, etc.). L’app ajoute automatiquement `litellm/` si tu saisis seulement `openai/...`, `ollama_chat/...` ou `vllm/...`.
+Pour un serveur OpenAI-compatible local ou privé, modifie `OPENAI_BASE_URL`, par exemple `http://localhost:8000/v1` pour vLLM ou `http://localhost:11434/v1` pour Ollama en mode OpenAI. L’interface Streamlit expose aussi ce champ dans la sidebar; au runtime l’app renseigne `OPENAI_BASE_URL` et `OPENAI_API_BASE` pour PageIndex/LiteLLM. L’app suit la normalisation de PageIndex `dev` : les modèles simples (`gpt-4o-mini`) et `openai/...` restent inchangés, `litellm/...` reste inchangé, et les autres chemins provider (`ollama_chat/...`, `vllm/...`) reçoivent automatiquement le préfixe `litellm/`.
 
 `OPENAI_AGENTS_DISABLE_TRACING=1` est recommandé par défaut avec les serveurs locaux ou clés non-OpenAI : cela évite que l’OpenAI Agents SDK tente d’exporter des traces vers OpenAI et produise une erreur 401 non fatale.
 
-Si le stream retourne `Error streaming response: Internal Server Error`, l’app tente automatiquement un second appel PageIndex non-streaming hors de la boucle asyncio du stream et affiche un diagnostic sans exposer la clé API. Si ce retry échoue aussi, vérifie surtout `OPENAI_BASE_URL`, le token, et les préfixes provider LiteLLM des modèles.
+`PAGEINDEX_STREAMING=false` est recommandé si la réponse est très lente ou si ton endpoint local ne supporte pas bien le streaming PageIndex : l’app fait alors directement un seul appel non-streaming au lieu d’essayer le streaming puis un retry. Tu peux l’activer dans la sidebar quand le streaming fonctionne correctement.
+
+À chaque question, l’app entoure la demande utilisateur avec des consignes PageIndex inspirées de l’exemple officiel : vérifier les métadonnées, explorer la structure, récupérer uniquement des plages page/ligne serrées et répondre seulement depuis le contenu récupéré. Cela vise à améliorer la pertinence sans réintroduire de chunks locaux ni de fallback lexical.
+
+Si le stream retourne `Error streaming response: Internal Server Error` quand `PAGEINDEX_STREAMING=true`, l’app tente automatiquement un second appel PageIndex non-streaming hors de la boucle asyncio du stream et affiche un diagnostic sans exposer la clé API. Si ce retry échoue aussi, vérifie surtout `OPENAI_BASE_URL`, le token, et les préfixes provider LiteLLM des modèles.
 
 For PageIndex cloud mode:
 

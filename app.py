@@ -135,19 +135,34 @@ def build_pageindex_error_message(*, stream_error: BaseException, retry_error: O
 
 
 def normalize_litellm_model_name(model: str) -> str:
-    """Route local PageIndex models through the Agents SDK LiteLLM provider.
+    """Normalize model names the same way PageIndex ``dev`` does.
 
-    PageIndex passes the model string directly to OpenAI Agents. In that SDK,
-    provider-prefixed LiteLLM routing requires a top-level ``litellm/`` prefix
-    (for example ``litellm/openai/gpt-4o-mini`` or
-    ``litellm/ollama_chat/llama3.1``). Without it, ``openai/...`` uses the
-    default OpenAI provider/Responses path, which often fails against local
-    OpenAI-compatible servers.
+    PageIndex validates the indexing model with LiteLLM, then normalizes the
+    retrieval model internally: plain model names such as ``gpt-4o-mini`` stay
+    plain, ``openai/...`` and ``litellm/...`` are preserved, and other
+    provider paths are routed through the Agents SDK LiteLLM provider.
     """
     value = model.strip()
-    if not value or value.startswith(("litellm/", "any-llm/")):
+    passthrough_prefixes = ("litellm/", "openai/")
+    if not value or "/" not in value or value.startswith(passthrough_prefixes):
         return value
     return f"litellm/{value}"
+
+
+def build_pageindex_query_prompt(question: str) -> str:
+    """Add the official PageIndex agent guidance around the user's question."""
+    clean_question = question.strip()
+    return (
+        "Réponds à la question ci-dessous avec PageIndex uniquement. "
+        "Commence par vérifier les métadonnées du document, puis utilise la "
+        "structure PageIndex pour choisir les sections pertinentes, puis récupère "
+        "seulement les pages/lignes nécessaires avec des plages serrées. "
+        "Base la réponse exclusivement sur le contenu récupéré; si l'information "
+        "n'est pas dans les documents, dis-le clairement. Donne une réponse concise "
+        "et cite les pages, lignes ou sections quand elles sont disponibles.\n\n"
+        f"Question utilisateur : {clean_question}"
+    )
+
 
 def configure_llm_environment(
     *,
@@ -260,6 +275,21 @@ def run_pageindex_query_non_stream(*, collection: Any, question: str, doc_ids: L
     )
 
 
+def _run_pageindex_query_non_stream_any_context(*, collection: Any, question: str, doc_ids: List[str]) -> str:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return run_pageindex_query_non_stream(collection=collection, question=question, doc_ids=doc_ids)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(
+            run_pageindex_query_non_stream,
+            collection=collection,
+            question=question,
+            doc_ids=doc_ids,
+        ).result()
+
+
 def run_pageindex_query(
     *,
     collection: Any,
@@ -267,14 +297,25 @@ def run_pageindex_query(
     doc_ids: List[str],
     on_answer_delta: Callable[[str], None],
     on_trace: Callable[[dict], None],
+    prefer_stream: bool,
 ) -> str:
-    """Run PageIndex query with streaming, then retry PageIndex non-stream on stream failure."""
+    """Run PageIndex query, optionally streaming, with non-stream fallback."""
+
+    prompt = build_pageindex_query_prompt(question)
+
+    if not prefer_stream:
+        on_trace({"type": "non_stream", "data": "Streaming désactivé: requête PageIndex non-stream directe."})
+        return _run_pageindex_query_non_stream_any_context(
+            collection=collection,
+            question=prompt,
+            doc_ids=doc_ids,
+        ).strip()
 
     async def consume_stream() -> str:
         final_answer_parts: List[str] = []
         final_answer = ""
         try:
-            stream = collection.query(question, doc_ids=doc_ids or None, stream=True)
+            stream = collection.query(prompt, doc_ids=doc_ids or None, stream=True)
             async for event in stream:
                 event_type = getattr(event, "type", "")
                 data = getattr(event, "data", None)
@@ -300,7 +341,7 @@ def run_pageindex_query(
                 retry_answer = await asyncio.to_thread(
                     run_pageindex_query_non_stream,
                     collection=collection,
-                    question=question,
+                    question=prompt,
                     doc_ids=doc_ids,
                 )
                 if retry_answer:
@@ -384,6 +425,15 @@ with st.sidebar:
     )
 
     st.divider()
+    prefer_stream = st.checkbox(
+        "Activer streaming des réponses",
+        value=env_bool("PAGEINDEX_STREAMING", False),
+        help=(
+            "Désactivé par défaut pour éviter une double requête lente quand le "
+            "serveur local/OpenAI-compatible ne gère pas correctement le streaming "
+            "PageIndex. Active-le seulement si ton endpoint supporte bien le streaming."
+        ),
+    )
     show_traces = st.checkbox("Afficher appels outils PageIndex", value=env_bool("PAGEINDEX_SHOW_TRACES", False))
 
 uploaded_files = st.file_uploader(
@@ -517,6 +567,7 @@ with col_right:
                         doc_ids=doc_ids,
                         on_answer_delta=append_delta,
                         on_trace=append_trace,
+                        prefer_stream=prefer_stream,
                     )
                     if answer and answer != nonlocal_answer["value"]:
                         placeholder.markdown(answer)
