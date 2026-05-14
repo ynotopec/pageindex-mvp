@@ -343,11 +343,30 @@ def index_with_pageindex(collection: Any, pdf_path: Path) -> str:
     return str(collection.add(str(pdf_path)))
 
 
-def compact_structure(structure: str, limit: int) -> str:
-    structure = structure.strip()
-    if len(structure) <= limit:
-        return structure
-    return structure[:limit] + "\n... [structure tronquée]"
+def pageindex_value_to_text(value: Any) -> str:
+    """Convert PageIndex SDK responses into prompt-safe text.
+
+    Depending on the PageIndex version, methods such as
+    ``get_document_structure`` and ``get_page_content`` may return plain
+    strings, lists, dictionaries, or other JSON-serialisable objects. The
+    chat pipeline expects text, so centralise the conversion here instead of
+    calling string-only methods such as ``strip`` directly on SDK responses.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except TypeError:
+        return str(value)
+
+
+def compact_structure(structure: Any, limit: int) -> str:
+    structure_text = pageindex_value_to_text(structure).strip()
+    if len(structure_text) <= limit:
+        return structure_text
+    return structure_text[:limit] + "\n... [structure tronquée]"
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
@@ -447,7 +466,7 @@ def build_pageindex_context(
             llm_kwargs=llm_kwargs,
             max_structure_chars=max_structure_chars,
         )
-        content = client.get_page_content(doc_id, pages)
+        content = pageindex_value_to_text(client.get_page_content(doc_id, pages))
 
         traces.append(
             {
