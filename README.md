@@ -1,26 +1,31 @@
 # pageindex-mvp
 
-Minimal Streamlit app for PDF question-answering. Upload one or more PDFs, build a PageIndex-inspired hierarchical document index, then ask questions using either a local Ollama model or the popular OpenAI-compatible Chat Completions API.
+Minimal Streamlit app for document question-answering with VectifyAI/PageIndex.
+Upload PDF or Markdown documents, index them with PageIndex, then ask questions
+through the PageIndex agentic `Collection.query(...)` flow.
 
 ## Retrieval approach
 
-The app now uses a lightweight PageIndex-inspired, vectorless RAG pipeline:
+The app now uses PageIndex directly and intentionally has no lexical fallback:
 
-- extracts PDF text page-by-page with PyMuPDF, with a pypdf fallback;
-- detects natural headings and numbered sections to build a table-of-contents-style tree;
-- retrieves section nodes with weighted title/summary/text scoring instead of only fixed-size chunks;
-- injects document, section and page references into the LLM prompt for better traceability.
+- indexes files with `PageIndexClient(...).collection(...).add(path)`;
+- relies on PageIndex's hierarchical tree index instead of local chunks or embeddings;
+- answers with `collection.query(...)`, so the PageIndex agent can call its tools
+  (`list_documents`, `get_document`, `get_document_structure`, `get_page_content`)
+  and retrieve tight page/line ranges;
+- supports local self-hosted mode or PageIndex cloud mode when `PAGEINDEX_API_KEY`
+  is configured.
 
-This remains a local MVP, not the full VectifyAI/PageIndex implementation or cloud OCR pipeline.
+If PageIndex is not installed/configured, indexing and chat fail explicitly instead
+of falling back to a weaker lexical retriever.
 
 ## Requirements
 
 - Linux/macOS shell with `bash`
 - Python 3.10+
 - `uv` (the installer bootstraps it with `python3 -m pip --user` if missing)
-- One LLM backend:
-  - Ollama, for local/tokenless inference; or
-  - an OpenAI-compatible API token and base URL
+- PageIndex dependencies, including an LLM API key for local indexing/querying, or
+  a PageIndex cloud API key
 
 The install/run scripts are idempotent and use `~/venv/<basename project dir>` by default, for example `~/venv/pageindex-mvp`.
 
@@ -34,28 +39,30 @@ source ./run.sh 0.0.0.0 8501
 
 Then open `http://127.0.0.1:8501`.
 
-## Configure an API token
+## Configure PageIndex
 
-Edit `.env`:
+For local self-hosted PageIndex, configure the LLM provider expected by your
+PageIndex model. For OpenAI-compatible defaults, edit `.env`:
 
 ```bash
-LLM_PROVIDER=openai_compatible
 OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o-mini
+PAGEINDEX_MODEL=gpt-4o-2024-11-20
+PAGEINDEX_RETRIEVE_MODEL=gpt-4o-2024-11-20
 ```
 
-For Ollama:
+For PageIndex cloud mode:
 
 ```bash
-LLM_PROVIDER=ollama
-OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=gpt-oss
+PAGEINDEX_API_KEY=your-pageindex-key
 ```
 
 ## H100 / DGX Spark notes
 
-The app is backend-agnostic. On H100/DGX Spark hosts, run a GPU-serving backend such as Ollama, vLLM, or another OpenAI-compatible server on the host, then point `.env` at it. If you need to pin GPUs, set `CUDA_VISIBLE_DEVICES` in `.env`.
+The Streamlit app is backend-agnostic; PageIndex/LiteLLM chooses the indexing and
+retrieval model. On H100/DGX Spark hosts, run a GPU-serving backend such as
+vLLM/Ollama if supported by your PageIndex/LiteLLM model string, then set the
+corresponding model and provider environment variables. If you need to pin GPUs,
+set `CUDA_VISIBLE_DEVICES` in `.env`.
 
 ## systemd example
 
