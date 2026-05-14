@@ -19,6 +19,7 @@ from typing import List, Tuple
 
 import requests
 import streamlit as st
+from openai import OpenAI
 from pypdf import PdfReader
 
 
@@ -85,14 +86,33 @@ def top_k_chunks(query: str, chunks: List[dict], k: int = 4) -> List[Tuple[int, 
 
 
 # ----------------------------
-# Ollama streaming
+# LLM streaming
 # ----------------------------
-def ollama_chat_stream(model: str, host: str, messages: List[dict]):
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def ollama_chat_stream(model: str, host: str, messages: List[dict], temperature: float, max_tokens: int):
     """
     Yield incremental tokens from Ollama /api/chat streaming response.
     """
     url = f"{host.rstrip('/')}/api/chat"
-    payload = {"model": model, "stream": True, "messages": messages}
+    payload = {
+        "model": model,
+        "stream": True,
+        "messages": messages,
+        "options": {"temperature": temperature, "num_predict": max_tokens},
+    }
     with requests.post(url, json=payload, stream=True, timeout=300) as r:
         r.raise_for_status()
         for line in r.iter_lines(decode_unicode=True):
@@ -116,6 +136,64 @@ def ollama_chat_stream(model: str, host: str, messages: List[dict]):
             # fin
             if data.get("done") is True:
                 break
+
+
+def openai_compatible_chat_stream(
+    model: str,
+    base_url: str,
+    api_key: str,
+    messages: List[dict],
+    temperature: float,
+    max_tokens: int,
+):
+    """Yield tokens from the popular OpenAI-compatible Chat Completions API."""
+    client = OpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+    )
+    for event in stream:
+        if not event.choices:
+            continue
+        delta = event.choices[0].delta.content
+        if delta:
+            yield delta
+
+
+def chat_stream(
+    provider: str,
+    messages: List[dict],
+    ollama_host: str,
+    ollama_model: str,
+    openai_base_url: str,
+    openai_api_key: str,
+    openai_model: str,
+    temperature: float,
+    max_tokens: int,
+):
+    if provider == "openai_compatible":
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai_compatible.")
+        yield from openai_compatible_chat_stream(
+            model=openai_model,
+            base_url=openai_base_url,
+            api_key=openai_api_key,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return
+
+    yield from ollama_chat_stream(
+        model=ollama_model,
+        host=ollama_host,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
 
 def build_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[Tuple[int, dict]]]:
@@ -142,18 +220,42 @@ def build_context(question: str, chunks: List[dict], k: int) -> Tuple[str, List[
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="PDF → Ollama (RAG local)", layout="wide")
-st.title("PDF → Q&A avec Ollama (local)")
+st.set_page_config(page_title="PDF → Q&A (RAG)", layout="wide")
+st.title("PDF → Q&A (RAG local + API)")
 
+default_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 default_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+default_ollama_model = os.getenv("OLLAMA_MODEL", "gpt-oss")
+default_openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+default_openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+default_openai_api_key = os.getenv("OPENAI_API_KEY", "")
+default_temperature = env_float("LLM_TEMPERATURE", 0.0)
+default_max_tokens = env_int("LLM_MAX_TOKENS", 1024)
 
 with st.sidebar:
     st.header("Paramètres")
-    host = st.text_input("Ollama host", value=default_ollama_host)
-    model = st.text_input("Modèle Ollama", value="gpt-oss")
-    k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=4)
-    max_chars = st.slider("Taille chunk (chars)", min_value=600, max_value=4000, value=1800, step=100)
-    overlap = st.slider("Overlap (chars)", min_value=0, max_value=800, value=200, step=50)
+    provider_options = ["ollama", "openai_compatible"]
+    provider_index = provider_options.index(default_provider) if default_provider in provider_options else 0
+    provider = st.selectbox("Provider LLM", provider_options, index=provider_index)
+
+    with st.expander("Ollama", expanded=(provider == "ollama")):
+        ollama_host = st.text_input("Ollama host", value=default_ollama_host)
+        ollama_model = st.text_input("Modèle Ollama", value=default_ollama_model)
+
+    with st.expander("API OpenAI-compatible", expanded=(provider == "openai_compatible")):
+        openai_base_url = st.text_input("Base URL", value=default_openai_base_url)
+        openai_model = st.text_input("Modèle API", value=default_openai_model)
+        openai_api_key = st.text_input("Token API", value=default_openai_api_key, type="password")
+
+    k = st.slider("Top-K chunks injectés", min_value=1, max_value=10, value=env_int("TOP_K", 4))
+    max_chars = st.slider(
+        "Taille chunk (chars)", min_value=600, max_value=4000, value=env_int("CHUNK_MAX_CHARS", 1800), step=100
+    )
+    overlap = st.slider(
+        "Overlap (chars)", min_value=0, max_value=800, value=env_int("CHUNK_OVERLAP", 200), step=50
+    )
+    temperature = st.slider("Température", min_value=0.0, max_value=2.0, value=default_temperature, step=0.1)
+    max_tokens = st.slider("Max tokens", min_value=128, max_value=8192, value=default_max_tokens, step=128)
     show_context = st.checkbox("Afficher le contexte injecté", value=False)
 
 if overlap >= max_chars:
@@ -282,17 +384,33 @@ Réponds en français, de façon concise et factuelle. Appuie-toi uniquement sur
                 ]
 
                 try:
-                    for tok in ollama_chat_stream(model=model, host=host, messages=messages):
+                    for tok in chat_stream(
+                        provider=provider,
+                        messages=messages,
+                        ollama_host=ollama_host,
+                        ollama_model=ollama_model,
+                        openai_base_url=openai_base_url,
+                        openai_api_key=openai_api_key,
+                        openai_model=openai_model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    ):
                         acc += tok
                         placeholder.markdown(acc)
                 except requests.exceptions.ConnectionError:
                     st.error(
                         "Impossible de joindre Ollama. Vérifie qu’Ollama tourne et que l’URL est bonne "
-                        f"({host})."
+                        f"({ollama_host})."
                     )
                     acc = ""
                 except requests.HTTPError as e:
                     st.error(f"Erreur HTTP Ollama: {e}")
+                    acc = ""
+                except ValueError as e:
+                    st.error(str(e))
+                    acc = ""
+                except Exception as e:
+                    st.error(f"Erreur API LLM: {e}")
                     acc = ""
 
             if acc.strip():

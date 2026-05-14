@@ -1,50 +1,53 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Run with: source ./run.sh [IP] [PORT]
+# Also works from systemd ExecStart=/usr/bin/bash -lc '/path/to/run.sh 0.0.0.0 8501'
 
-serverAddress=$1
-portNumber=$2
+_pageindex_run() {
+  set -Eeuo pipefail
 
-pythonVersion=python3
+  local server_address="${1:-${SERVER_NAME:-${STREAMLIT_SERVER_ADDRESS:-}}}"
+  local port_number="${2:-${SERVER_PORT:-${STREAMLIT_SERVER_PORT:-8501}}}"
+  local project_dir project_name venv_dir python_bin
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-pythonDir=~/"venv/$(basename "${DIR}")"
-cd $DIR
+  project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  project_name="$(basename "${project_dir}")"
+  venv_dir="${VENV_DIR:-${HOME}/venv/${project_name}}"
+  python_bin="${venv_dir}/bin/python"
 
-deactivate 2>/dev/null
-mkdir -p "${pythonDir}"
-${pythonVersion} -m venv "${pythonDir}"
-source "${pythonDir}"/bin/activate
+  cd "${project_dir}"
 
-#intall
-${pythonVersion} -m pip cache purge
-${pythonVersion} -m pip install -U pip setuptools wheel
-${pythonVersion} -m pip install -U -r requirements.txt
-#optimize space
-#(jdupes -X size+:99M -r -L ~ >/dev/null 2>&1 )&
+  if [ ! -x "${python_bin}" ]; then
+    "${project_dir}/install.sh"
+  fi
 
-export HF_HUB_DISABLE_TELEMETRY=1
-if [ ! -z "${serverAddress}" ] ;then
-  export GRADIO_SERVER_NAME="${serverAddress}"
-  export SERVER_NAME="${serverAddress}"
-fi
-if [ ! -z "${portNumber}" ] ;then
-  export GRADIO_SERVER_PORT="${portNumber}"
-  export SERVER_PORT="${portNumber}"
-  export BACK_PORT=$((SERVER_PORT + 1))
-fi
-#export CUDA_LAUNCH_BLOCKING=1
+  # shellcheck disable=SC1091
+  source "${venv_dir}/bin/activate"
 
-# Charger les variables d'environnement depuis .env
-if [ -f ".env" ]; then
-#  export $(grep -v '^#' .env | xargs)
-  set -a
-  source .env
-  set +a
-else
-  echo ".env file not found!"
-  exit 1
-fi
+  if [ -f "${project_dir}/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${project_dir}/.env"
+    set +a
+  fi
 
-#${pythonVersion} app.py $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-${pythonVersion} -m streamlit run app.py --browser.gatherUsageStats false $([ ! -z "${serverAddress}" ] && echo --server.address ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --server.port ${portNumber})
-#${pythonVersion} -m uvicorn app:app --reload $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-#${pythonVersion} back.py
+  export HF_HUB_DISABLE_TELEMETRY="${HF_HUB_DISABLE_TELEMETRY:-1}"
+  export SERVER_NAME="${server_address}"
+  export SERVER_PORT="${port_number}"
+  export STREAMLIT_SERVER_ADDRESS="${server_address}"
+  export STREAMLIT_SERVER_PORT="${port_number}"
+
+  local args=(
+    -m streamlit run app.py
+    --browser.gatherUsageStats false
+    --server.port "${port_number}"
+  )
+
+  if [ -n "${server_address}" ]; then
+    args+=(--server.address "${server_address}")
+  fi
+
+  "${python_bin}" "${args[@]}"
+}
+
+_pageindex_run "$@"
+unset -f _pageindex_run
