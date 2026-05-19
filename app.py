@@ -159,6 +159,25 @@ def build_pageindex_indexing_error_message(
     return message
 
 
+def is_internal_server_error(exc: BaseException) -> bool:
+    """Detect generic 5xx message surfaced by OpenAI-compatible backends."""
+    return "internal server error" in sanitize_error_text(exc).lower()
+
+
+def build_openai_compatibility_hint(exc: BaseException) -> str:
+    """Explain the backend capability expected by PageIndex/OpenAI Agents."""
+    if not is_internal_server_error(exc):
+        return ""
+    return (
+        " Le backend ciblé par OPENAI_BASE_URL doit être pleinement compatible "
+        "OpenAI Responses + tool calling (utilisés par openai-agents/PageIndex). "
+        "Certains endpoints OpenAI-compatibles partiels (chat/completions only) "
+        "répondent 500 sur ces appels. Vérifie d'abord avec OPENAI officiel "
+        "(https://api.openai.com/v1) ou un proxy LiteLLM/vLLM/Ollama qui supporte "
+        "Responses API et tool calls."
+    )
+
+
 def build_pageindex_error_message(*, stream_error: BaseException, retry_error: Optional[BaseException] = None) -> str:
     message = "Le streaming PageIndex a échoué."
     message += f" Détail streaming: {sanitize_error_text(stream_error)}"
@@ -170,6 +189,9 @@ def build_pageindex_error_message(*, stream_error: BaseException, retry_error: O
         "préfixé litellm/provider/... (ex. litellm/openai/..., litellm/ollama_chat/..., "
         "litellm/vllm/...)."
     )
+    message += build_openai_compatibility_hint(stream_error)
+    if retry_error is not None:
+        message += build_openai_compatibility_hint(retry_error)
     return message
 
 
@@ -670,7 +692,7 @@ with col_left:
                             }
                         )
                 except Exception as exc:
-                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}")
+                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}")
                     docs = []
 
             if docs:
@@ -755,7 +777,7 @@ with col_right:
                         st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
                 except Exception as exc:
                     answer = ""
-                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}")
+                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}")
 
             st.session_state.last_traces = traces
             if answer.strip():

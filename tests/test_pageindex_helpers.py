@@ -17,6 +17,8 @@ HELPER_NAMES = {
     "sanitize_error_text",
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
+    "is_internal_server_error",
+    "build_openai_compatibility_hint",
     "is_pageindex_processing_failure",
     "build_pageindex_indexing_error_message",
     "build_no_toc_retry_index_config",
@@ -172,6 +174,25 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertIn("OPENAI_BASE_URL", text)
         self.assertIn("Provider List", text)
+
+    def test_openai_compatibility_hint_detects_internal_server_error(self):
+        helpers = load_helpers()
+
+        exc = RuntimeError("Internal Server Error")
+        hint = helpers["build_openai_compatibility_hint"](exc)
+
+        self.assertTrue(helpers["is_internal_server_error"](exc))
+        self.assertIn("Responses", hint)
+        self.assertIn("tool", hint)
+
+    def test_build_pageindex_error_message_includes_compatibility_hint_on_500(self):
+        helpers = load_helpers()
+
+        text = helpers["build_pageindex_error_message"](stream_error=RuntimeError("Internal Server Error"))
+
+        self.assertIn("OpenAI Responses", text)
+        self.assertIn("OPENAI_BASE_URL", text)
+
 
     def test_processing_failed_indexing_message_recommends_no_toc_retry(self):
         helpers = load_helpers()
