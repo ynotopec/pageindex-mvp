@@ -238,7 +238,7 @@ def normalize_retrieve_model_name(model: str) -> str:
     preserved, and other provider paths are routed through the Agents SDK
     LiteLLM provider.
     """
-    value = model.strip()
+    value = normalize_env_text(model)
     passthrough_prefixes = ("litellm/", "openai/")
     if not value or "/" not in value or value.startswith(passthrough_prefixes):
         return value
@@ -260,6 +260,16 @@ def build_pageindex_query_prompt(question: str) -> str:
     )
 
 
+
+
+def normalize_env_text(value: str) -> str:
+    """Trim whitespace and unwrap matching single/double quotes."""
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1].strip()
+    return text
+
+
 def configure_llm_environment(
     *,
     llm_api_key: str,
@@ -274,8 +284,8 @@ def configure_llm_environment(
     SDK-compatible providers all receive the same base URL.
     """
     updates: Dict[str, str] = {}
-    api_key = llm_api_key.strip()
-    base_url = llm_base_url.strip().rstrip("/")
+    api_key = normalize_env_text(llm_api_key)
+    base_url = normalize_env_text(llm_base_url).rstrip("/")
 
     updates["OPENAI_AGENTS_DISABLE_TRACING"] = "1" if disable_tracing else "0"
 
@@ -354,9 +364,9 @@ def get_pageindex_client(
         if index_config is not None:
             kwargs["index_config"] = index_config
         if model:
-            kwargs["model"] = model.strip()
+            kwargs["model"] = normalize_env_text(model)
         if retrieve_model:
-            kwargs["retrieve_model"] = normalize_retrieve_model_name(retrieve_model)
+            kwargs["retrieve_model"] = normalize_retrieve_model_name(normalize_env_text(retrieve_model))
     return PageIndexClient(**kwargs)
 
 
@@ -571,6 +581,7 @@ with st.sidebar:
         "Un test positif en chat.completions seul n'est pas suffisant: PageIndex agentique "
         "utilise Responses + tools."
     )
+    st.caption("Syntaxe .env: évite les guillemets inutiles; en cas de doute, l'app retire automatiquement les quotes externes.")
     llm_api_key = st.text_input(
         "OPENAI_API_KEY",
         value=default_llm_api_key,

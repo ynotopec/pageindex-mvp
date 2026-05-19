@@ -13,6 +13,7 @@ HELPER_NAMES = {
     "compact_text",
     "_doc_name_from_metadata",
     "_doc_id_from_metadata",
+    "normalize_env_text",
     "configure_llm_environment",
     "build_endpoint_diagnostic",
     "build_model_diagnostic",
@@ -110,6 +111,14 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertEqual(text, "abc\n... [sortie tronquée]")
 
+    def test_normalize_env_text_unwraps_outer_quotes(self):
+        helpers = load_helpers()
+
+        self.assertEqual(helpers["normalize_env_text"](" 'abc' "), "abc")
+        self.assertEqual(helpers["normalize_env_text"](' "abc" '), "abc")
+        self.assertEqual(helpers["normalize_env_text"]("a'b"), "a'b")
+
+
     def test_configure_llm_environment_sets_base_url_aliases(self):
         helpers = load_helpers()
         original = {
@@ -140,6 +149,30 @@ class PageIndexHelperTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_configure_llm_environment_accepts_quoted_values(self):
+        helpers = load_helpers()
+        original = {
+            key: os.environ.get(key)
+            for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+        }
+        try:
+            helpers["configure_llm_environment"](
+                llm_api_key="'sk-quoted'",
+                llm_base_url='"http://localhost:8000/v1/"',
+                disable_tracing=True,
+            )
+
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-quoted")
+            self.assertEqual(os.environ["OPENAI_BASE_URL"], "http://localhost:8000/v1")
+            self.assertEqual(os.environ["OPENAI_API_BASE"], "http://localhost:8000/v1")
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
 
     def test_configure_llm_environment_can_enable_tracing(self):
         helpers = load_helpers()
