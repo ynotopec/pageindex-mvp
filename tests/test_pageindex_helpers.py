@@ -19,6 +19,7 @@ HELPER_NAMES = {
     "build_pageindex_error_message",
     "is_internal_server_error",
     "build_openai_compatibility_hint",
+    "is_litellm_model_group_error",
     "is_pageindex_processing_failure",
     "build_pageindex_indexing_error_message",
     "build_no_toc_retry_index_config",
@@ -192,6 +193,17 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertIn("OpenAI Responses", text)
         self.assertIn("OPENAI_BASE_URL", text)
+
+
+    def test_litellm_model_group_error_gets_specific_hint(self):
+        helpers = load_helpers()
+
+        exc = RuntimeError("Received Model Group=ai-tools Available Model Group Fallbacks=None Internal Server Error")
+        hint = helpers["build_openai_compatibility_hint"](exc)
+
+        self.assertTrue(helpers["is_litellm_model_group_error"](exc))
+        self.assertIn("ai-tools", hint)
+        self.assertIn("model group", hint.lower())
 
 
     def test_processing_failed_indexing_message_recommends_no_toc_retry(self):

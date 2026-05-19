@@ -164,11 +164,18 @@ def is_internal_server_error(exc: BaseException) -> bool:
     return "internal server error" in sanitize_error_text(exc).lower()
 
 
+
+
+def is_litellm_model_group_error(exc: BaseException) -> bool:
+    """Detect LiteLLM proxy routing errors about missing model groups."""
+    text = sanitize_error_text(exc).lower()
+    return "model group" in text and ("available model group fallbacks" in text or "received model group" in text)
+
 def build_openai_compatibility_hint(exc: BaseException) -> str:
     """Explain the backend capability expected by PageIndex/OpenAI Agents."""
     if not is_internal_server_error(exc):
         return ""
-    return (
+    message = (
         " Le backend ciblé par OPENAI_BASE_URL doit être pleinement compatible "
         "OpenAI Responses + tool calling (utilisés par openai-agents/PageIndex). "
         "Certains endpoints OpenAI-compatibles partiels (chat/completions only) "
@@ -178,6 +185,15 @@ def build_openai_compatibility_hint(exc: BaseException) -> str:
         "Pour isoler le problème, vérifie d'abord avec OPENAI officiel "
         "(https://api.openai.com/v1)."
     )
+    if is_litellm_model_group_error(exc):
+        message += (
+            " Avec LiteLLM proxy, l'erreur 'Received Model Group=...' indique souvent "
+            "que ce model group n'est pas routé dans la config (ou sans fallback). "
+            "Ajoute un mapping pour ce group (ex. ai-tools) vers un modèle/provider "
+            "valide, ou aligne PAGEINDEX_MODEL/PAGEINDEX_RETRIEVE_MODEL sur un model "
+            "group existant côté proxy."
+        )
+    return message
 
 
 def build_pageindex_error_message(*, stream_error: BaseException, retry_error: Optional[BaseException] = None) -> str:
