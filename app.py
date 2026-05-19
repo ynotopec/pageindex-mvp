@@ -282,6 +282,30 @@ def configure_llm_environment(
 
 
 
+
+
+def build_model_diagnostic(*, index_model: str, retrieve_model: str) -> str:
+    """Return non-secret runtime model diagnostics for troubleshooting."""
+    left = index_model.strip()
+    right = retrieve_model.strip()
+    if not left and not right:
+        return ""
+    return f" Modèles actifs: index={left or '[default]'}, retrieve={right or '[default]'}"
+
+
+def build_backend_verdict_hint(exc: BaseException, *, endpoint: str) -> str:
+    """Provide explicit verdict text when backend appears incompatible."""
+    if not is_internal_server_error(exc):
+        return ""
+    if "api.openai.com/v1" in endpoint:
+        return ""
+    return (
+        " Verdict runtime: backend non compatible avec ce flux agentique "
+        "(Responses+tools) dans la configuration actuelle. "
+        "Si OpenAI officiel fonctionne avec les mêmes documents/questions, "
+        "le blocage vient du backend local/proxy actuel (ex. SGLang direct)."
+    )
+
 def build_endpoint_diagnostic() -> str:
     """Return non-secret runtime endpoint diagnostics for troubleshooting."""
     base_url = (os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or "").strip()
@@ -729,7 +753,7 @@ with col_left:
                             }
                         )
                 except Exception as exc:
-                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}")
+                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
                     docs = []
 
             if docs:
@@ -814,7 +838,7 @@ with col_right:
                         st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
                 except Exception as exc:
                     answer = ""
-                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_endpoint_diagnostic()}")
+                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
 
             st.session_state.last_traces = traces
             if answer.strip():

@@ -15,6 +15,8 @@ HELPER_NAMES = {
     "_doc_id_from_metadata",
     "configure_llm_environment",
     "build_endpoint_diagnostic",
+    "build_model_diagnostic",
+    "build_backend_verdict_hint",
     "sanitize_error_text",
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
@@ -201,6 +203,29 @@ class PageIndexHelperTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+
+    def test_build_model_diagnostic_includes_active_models(self):
+        helpers = load_helpers()
+
+        text = helpers["build_model_diagnostic"](
+            index_model="qwen3.6",
+            retrieve_model="qwen3.6",
+        )
+
+        self.assertIn("qwen3.6", text)
+        self.assertIn("index=", text)
+
+    def test_backend_verdict_hint_flags_non_openai_500(self):
+        helpers = load_helpers()
+
+        text = helpers["build_backend_verdict_hint"](
+            RuntimeError("Internal Server Error"),
+            endpoint="http://10.0.1.1:8572/v1",
+        )
+
+        self.assertIn("Verdict runtime", text)
+        self.assertIn("non compatible", text)
 
 
     def test_sanitize_error_text_redacts_api_keys(self):
