@@ -17,6 +17,9 @@ HELPER_NAMES = {
     "sanitize_error_text",
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
+    "is_pageindex_processing_failure",
+    "build_pageindex_indexing_error_message",
+    "build_no_toc_retry_index_config",
     "run_pageindex_query_non_stream",
     "normalize_retrieve_model_name",
     "build_pageindex_query_prompt",
@@ -169,6 +172,41 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertIn("OPENAI_BASE_URL", text)
         self.assertIn("Provider List", text)
+
+    def test_processing_failed_indexing_message_recommends_no_toc_retry(self):
+        helpers = load_helpers()
+
+        error = RuntimeError("Failed to index /tmp/report.pdf: Processing failed")
+        text = helpers["build_pageindex_indexing_error_message"](
+            stored_path=Path("/tmp/report.pdf"),
+            error=error,
+        )
+
+        self.assertTrue(helpers["is_pageindex_processing_failure"](error))
+        self.assertIn("toc_check_page_num=0", text)
+        self.assertIn("sans TOC", text)
+
+    def test_retry_index_config_only_disables_toc_detection(self):
+        helpers = load_helpers()
+
+        config = helpers["build_index_config"](
+            toc_check_page_num=20,
+            max_page_num_each_node=8,
+            max_token_num_each_node=12000,
+            if_add_node_id=True,
+            if_add_node_summary=False,
+            if_add_doc_description=True,
+            if_add_node_text=False,
+        )
+        retry_config = helpers["build_no_toc_retry_index_config"](config)
+
+        self.assertEqual(retry_config.toc_check_page_num, 0)
+        self.assertEqual(retry_config.max_page_num_each_node, 8)
+        self.assertEqual(retry_config.max_token_num_each_node, 12000)
+        self.assertTrue(retry_config.if_add_node_id)
+        self.assertFalse(retry_config.if_add_node_summary)
+        self.assertTrue(retry_config.if_add_doc_description)
+        self.assertFalse(retry_config.if_add_node_text)
 
     def test_non_stream_query_helper_requires_no_running_loop(self):
         helpers = load_helpers()

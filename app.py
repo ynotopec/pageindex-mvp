@@ -121,6 +121,44 @@ def pageindex_query_result_to_text(result: Any) -> str:
     return pageindex_value_to_text(result).strip()
 
 
+def is_pageindex_processing_failure(exc: BaseException) -> bool:
+    """Detect PageIndex's generic local PDF tree-building failure."""
+    return "processing failed" in sanitize_error_text(exc).lower()
+
+
+def build_pageindex_indexing_error_message(
+    *,
+    stored_path: Path,
+    error: BaseException,
+    retried_without_toc_detection: bool = False,
+    retry_error: Optional[BaseException] = None,
+) -> str:
+    """Build an actionable, sanitized message for PageIndex indexing failures."""
+    detail = sanitize_error_text(error)
+    message = f"Failed to index {stored_path}: {detail}"
+    if retry_error is not None:
+        message += f" Retry toc_check_page_num=0: {sanitize_error_text(retry_error)}"
+
+    retry_failed_processing = (
+        retry_error is not None and is_pageindex_processing_failure(retry_error)
+    )
+    if is_pageindex_processing_failure(error) or retry_failed_processing:
+        if retried_without_toc_detection:
+            message += (
+                " PageIndex a aussi échoué après un retry automatique avec "
+                "toc_check_page_num=0. Vérifie que le PDF contient du texte sélectionnable "
+                "(pas uniquement des scans/images), utilise un modèle d'indexation plus fiable "
+                "ou convertis/OCR le document avant de le réimporter."
+            )
+        else:
+            message += (
+                " PageIndex signale souvent cette erreur quand la table des matières du PDF "
+                "est mal détectée ou mal alignée avec les pages. En mode local, réessaie avec "
+                "toc_check_page_num=0 dans IndexConfig pour forcer l'extraction sans TOC."
+            )
+    return message
+
+
 def build_pageindex_error_message(*, stream_error: BaseException, retry_error: Optional[BaseException] = None) -> str:
     message = "Le streaming PageIndex a échoué."
     message += f" Détail streaming: {sanitize_error_text(stream_error)}"
@@ -250,6 +288,19 @@ def build_index_config(
         if_add_node_summary=if_add_node_summary,
         if_add_doc_description=if_add_doc_description,
         if_add_node_text=if_add_node_text,
+    )
+
+
+def build_no_toc_retry_index_config(index_config: IndexConfig) -> IndexConfig:
+    """Copy the active local IndexConfig but disable TOC detection for one retry."""
+    return build_index_config(
+        toc_check_page_num=0,
+        max_page_num_each_node=int(index_config.max_page_num_each_node),
+        max_token_num_each_node=int(index_config.max_token_num_each_node),
+        if_add_node_id=bool(index_config.if_add_node_id),
+        if_add_node_summary=bool(index_config.if_add_node_summary),
+        if_add_doc_description=bool(index_config.if_add_doc_description),
+        if_add_node_text=bool(index_config.if_add_node_text),
     )
 
 
@@ -562,8 +613,53 @@ with col_left:
                     for file in uploaded_files:
                         data = file.read()
                         stored_path = write_uploaded_document(storage_path, file.name, data)
-                        doc_id = index_with_pageindex(pageindex_collection, stored_path)
-                        metadata = pageindex_collection.get_document(doc_id)
+                        active_collection = pageindex_collection
+                        try:
+                            doc_id = index_with_pageindex(active_collection, stored_path)
+                        except Exception as index_exc:
+                            can_retry_without_toc = (
+                                not pageindex_api_key
+                                and is_pageindex_processing_failure(index_exc)
+                                and int(local_index_config.toc_check_page_num) != 0
+                            )
+                            if not can_retry_without_toc:
+                                raise RuntimeError(
+                                    build_pageindex_indexing_error_message(
+                                        stored_path=stored_path,
+                                        error=index_exc,
+                                    )
+                                ) from index_exc
+
+                            st.warning(
+                                f"{file.name}: PageIndex a renvoyé 'Processing failed'. "
+                                "Retry automatique avec toc_check_page_num=0 "
+                                "(détection TOC désactivée)."
+                            )
+                            retry_config = build_no_toc_retry_index_config(local_index_config)
+                            retry_client = get_pageindex_client(
+                                api_key=pageindex_api_key,
+                                model=pageindex_model,
+                                retrieve_model=pageindex_retrieve_model,
+                                storage_path=storage_path,
+                                llm_api_key=llm_api_key,
+                                llm_base_url=llm_base_url,
+                                disable_tracing=disable_tracing,
+                                index_config=retry_config,
+                            )
+                            active_collection = get_pageindex_collection(retry_client, collection_name)
+                            try:
+                                doc_id = index_with_pageindex(active_collection, stored_path)
+                            except Exception as retry_exc:
+                                raise RuntimeError(
+                                    build_pageindex_indexing_error_message(
+                                        stored_path=stored_path,
+                                        error=index_exc,
+                                        retried_without_toc_detection=True,
+                                        retry_error=retry_exc,
+                                    )
+                                ) from retry_exc
+
+                        metadata = active_collection.get_document(doc_id)
                         docs.append(
                             {
                                 "name": file.name,
@@ -574,7 +670,7 @@ with col_left:
                             }
                         )
                 except Exception as exc:
-                    st.error(f"Indexation PageIndex impossible : {exc}")
+                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}")
                     docs = []
 
             if docs:
