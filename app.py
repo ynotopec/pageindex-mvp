@@ -172,9 +172,11 @@ def build_openai_compatibility_hint(exc: BaseException) -> str:
         " Le backend ciblé par OPENAI_BASE_URL doit être pleinement compatible "
         "OpenAI Responses + tool calling (utilisés par openai-agents/PageIndex). "
         "Certains endpoints OpenAI-compatibles partiels (chat/completions only) "
-        "répondent 500 sur ces appels. Vérifie d'abord avec OPENAI officiel "
-        "(https://api.openai.com/v1) ou un proxy LiteLLM/vLLM/Ollama qui supporte "
-        "Responses API et tool calls."
+        "répondent 500 sur ces appels. Les modèles open source restent compatibles "
+        "si tu passes par un serveur/proxy qui expose correctement Responses API + "
+        "tool calls (ex. LiteLLM, vLLM récent, Ollama OpenAI mode selon version). "
+        "Pour isoler le problème, vérifie d'abord avec OPENAI officiel "
+        "(https://api.openai.com/v1)."
     )
 
 
@@ -490,6 +492,10 @@ with st.sidebar:
     storage_path_text = st.text_input("Storage local", value=str(workspace))
 
     st.subheader("LLM local / OpenAI-compatible")
+    st.caption(
+        "Oui, les modèles open source peuvent fonctionner, mais l'endpoint doit "
+        "supporter OpenAI Responses API + tool calling (requis par PageIndex/openai-agents)."
+    )
     llm_api_key = st.text_input(
         "OPENAI_API_KEY",
         value=default_llm_api_key,
