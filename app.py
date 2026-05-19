@@ -171,6 +171,20 @@ def is_litellm_model_group_error(exc: BaseException) -> bool:
     text = sanitize_error_text(exc).lower()
     return "model group" in text and ("available model group fallbacks" in text or "received model group" in text)
 
+
+
+def build_capability_gap_hint(exc: BaseException) -> str:
+    """Explain why chat.completions can work while agentic Responses calls fail."""
+    if not is_internal_server_error(exc):
+        return ""
+    return (
+        " Différence importante: un test réussi via chat.completions ne garantit pas "
+        "la compatibilité PageIndex. Cette app utilise openai-agents avec Responses API "
+        "+ tool calling; un backend peut répondre OK en chat.completions mais échouer en "
+        "Responses/tools."
+    )
+
+
 def build_openai_compatibility_hint(exc: BaseException) -> str:
     """Explain the backend capability expected by PageIndex/OpenAI Agents."""
     if not is_internal_server_error(exc):
@@ -208,8 +222,10 @@ def build_pageindex_error_message(*, stream_error: BaseException, retry_error: O
         "litellm/vllm/...)."
     )
     message += build_openai_compatibility_hint(stream_error)
+    message += build_capability_gap_hint(stream_error)
     if retry_error is not None:
         message += build_openai_compatibility_hint(retry_error)
+        message += build_capability_gap_hint(retry_error)
     return message
 
 
@@ -551,6 +567,10 @@ with st.sidebar:
         "Oui, les modèles open source peuvent fonctionner, mais l'endpoint doit "
         "supporter OpenAI Responses API + tool calling (requis par PageIndex/openai-agents)."
     )
+    st.caption(
+        "Un test positif en chat.completions seul n'est pas suffisant: PageIndex agentique "
+        "utilise Responses + tools."
+    )
     llm_api_key = st.text_input(
         "OPENAI_API_KEY",
         value=default_llm_api_key,
@@ -753,7 +773,7 @@ with col_left:
                             }
                         )
                 except Exception as exc:
-                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
+                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_capability_gap_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
                     docs = []
 
             if docs:
@@ -838,7 +858,7 @@ with col_right:
                         st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
                 except Exception as exc:
                     answer = ""
-                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
+                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_capability_gap_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
 
             st.session_state.last_traces = traces
             if answer.strip():

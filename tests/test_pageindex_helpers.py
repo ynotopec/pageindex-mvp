@@ -22,6 +22,7 @@ HELPER_NAMES = {
     "build_pageindex_error_message",
     "is_internal_server_error",
     "build_openai_compatibility_hint",
+    "build_capability_gap_hint",
     "is_litellm_model_group_error",
     "is_pageindex_processing_failure",
     "build_pageindex_indexing_error_message",
@@ -266,6 +267,15 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertIn("OpenAI Responses", text)
         self.assertIn("OPENAI_BASE_URL", text)
+
+
+    def test_capability_gap_hint_mentions_chat_completions_vs_responses(self):
+        helpers = load_helpers()
+
+        text = helpers["build_capability_gap_hint"](RuntimeError("Internal Server Error"))
+
+        self.assertIn("chat.completions", text)
+        self.assertIn("Responses", text)
 
 
     def test_litellm_model_group_error_gets_specific_hint(self):
