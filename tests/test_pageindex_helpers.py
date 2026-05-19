@@ -14,6 +14,7 @@ HELPER_NAMES = {
     "_doc_name_from_metadata",
     "_doc_id_from_metadata",
     "configure_llm_environment",
+    "build_endpoint_diagnostic",
     "sanitize_error_text",
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
@@ -154,6 +155,53 @@ class PageIndexHelperTests(unittest.TestCase):
                 os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
             else:
                 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = original
+
+    def test_configure_llm_environment_clears_previous_endpoint_and_key_when_empty(self):
+        helpers = load_helpers()
+        original = {
+            key: os.environ.get(key)
+            for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+        }
+        try:
+            os.environ["OPENAI_API_KEY"] = "sk-old"
+            os.environ["OPENAI_BASE_URL"] = "http://old/v1"
+            os.environ["OPENAI_API_BASE"] = "http://old/v1"
+
+            helpers["configure_llm_environment"](
+                llm_api_key="",
+                llm_base_url="",
+                disable_tracing=True,
+            )
+
+            self.assertNotIn("OPENAI_API_KEY", os.environ)
+            self.assertNotIn("OPENAI_BASE_URL", os.environ)
+            self.assertNotIn("OPENAI_API_BASE", os.environ)
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_build_endpoint_diagnostic_includes_active_base_url(self):
+        helpers = load_helpers()
+        original = {
+            key: os.environ.get(key)
+            for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE")
+        }
+        try:
+            os.environ["OPENAI_BASE_URL"] = "http://sglang:30000/v1"
+            text = helpers["build_endpoint_diagnostic"]()
+
+            self.assertIn("Endpoint actif", text)
+            self.assertIn("sglang", text)
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
 
     def test_sanitize_error_text_redacts_api_keys(self):
         helpers = load_helpers()

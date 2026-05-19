@@ -265,14 +265,29 @@ def configure_llm_environment(
 
     if api_key:
         updates["OPENAI_API_KEY"] = api_key
+    else:
+        os.environ.pop("OPENAI_API_KEY", None)
+
     if base_url:
         updates["OPENAI_BASE_URL"] = base_url
         updates["OPENAI_API_BASE"] = base_url
+    else:
+        os.environ.pop("OPENAI_BASE_URL", None)
+        os.environ.pop("OPENAI_API_BASE", None)
 
     os.environ.update(updates)
     set_tracing_disabled(disable_tracing)
     return updates
 
+
+
+
+def build_endpoint_diagnostic() -> str:
+    """Return non-secret runtime endpoint diagnostics for troubleshooting."""
+    base_url = (os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or "").strip()
+    if not base_url:
+        return ""
+    return f" Endpoint actif: {base_url}"
 
 def get_pageindex_client(
     *,
@@ -799,7 +814,7 @@ with col_right:
                         st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
                 except Exception as exc:
                     answer = ""
-                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}")
+                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_endpoint_diagnostic()}")
 
             st.session_state.last_traces = traces
             if answer.strip():
