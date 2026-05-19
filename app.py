@@ -31,6 +31,7 @@ os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
 from agents import set_tracing_disabled
 from openai import OpenAI
+from PyPDF2 import PdfReader
 import streamlit as st
 from pageindex import PageIndexClient  # type: ignore
 from pageindex.config import IndexConfig  # type: ignore
@@ -341,6 +342,30 @@ def build_endpoint_diagnostic() -> str:
     return f" Endpoint actif: {base_url}"
 
 
+
+
+def extract_document_text_for_fallback(path: str, max_chars: int = 30000) -> str:
+    """Extract plain text from stored markdown/pdf document for QA fallback."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return ""
+
+    suffix = file_path.suffix.lower()
+    if suffix in {".md", ".markdown", ".txt"}:
+        return file_path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+
+    if suffix == ".pdf":
+        pages: List[str] = []
+        reader = PdfReader(str(file_path))
+        for page in reader.pages:
+            pages.append((page.extract_text() or "").strip())
+            if sum(len(p) for p in pages) >= max_chars:
+                break
+        return "\n\n".join(pages)[:max_chars]
+
+    return ""
+
+
 def run_chat_completions_fallback(
     *,
     question: str,
@@ -356,20 +381,21 @@ def run_chat_completions_fallback(
     if not api_key or not base_url or not model_name:
         raise RuntimeError("Fallback chat.completions indisponible: OPENAI_API_KEY, OPENAI_BASE_URL et PAGEINDEX_MODEL sont requis.")
 
-    context = json.dumps(
-        [
+    context_parts: List[dict] = []
+    for doc in documents:
+        extracted = extract_document_text_for_fallback(str(doc.get("path") or ""), max_chars=30000)
+        context_parts.append(
             {
                 "name": doc.get("name"),
                 "doc_id": doc.get("doc_id"),
                 "metadata": doc.get("metadata"),
+                "extracted_text": extracted,
             }
-            for doc in documents
-        ],
-        ensure_ascii=False,
-        indent=2,
-    )
-    if len(context) > 60_000:
-        context = context[:60_000] + "\n...[CONTEXTE TRONQUÉ]..."
+        )
+
+    context = json.dumps(context_parts, ensure_ascii=False, indent=2)
+    if len(context) > 80_000:
+        context = context[:80_000] + "\n...[CONTEXTE TRONQUÉ]..."
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.chat.completions.create(
