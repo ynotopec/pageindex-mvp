@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
 from agents import set_tracing_disabled
+from openai import OpenAI
 import streamlit as st
 from pageindex import PageIndexClient  # type: ignore
 from pageindex.config import IndexConfig  # type: ignore
@@ -338,6 +339,55 @@ def build_endpoint_diagnostic() -> str:
     if not base_url:
         return ""
     return f" Endpoint actif: {base_url}"
+
+
+def run_chat_completions_fallback(
+    *,
+    question: str,
+    documents: List[dict],
+    llm_api_key: str,
+    llm_base_url: str,
+    model: str,
+) -> str:
+    """Fallback QA using plain chat.completions with indexed metadata context."""
+    api_key = normalize_env_text(llm_api_key or os.getenv("OPENAI_API_KEY", ""))
+    base_url = normalize_env_text(llm_base_url or os.getenv("OPENAI_BASE_URL", "")).rstrip("/")
+    model_name = normalize_env_text(model)
+    if not api_key or not base_url or not model_name:
+        raise RuntimeError("Fallback chat.completions indisponible: OPENAI_API_KEY, OPENAI_BASE_URL et PAGEINDEX_MODEL sont requis.")
+
+    context = json.dumps(
+        [
+            {
+                "name": doc.get("name"),
+                "doc_id": doc.get("doc_id"),
+                "metadata": doc.get("metadata"),
+            }
+            for doc in documents
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
+    if len(context) > 60_000:
+        context = context[:60_000] + "\n...[CONTEXTE TRONQUÉ]..."
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    response = client.chat.completions.create(
+        model=model_name.replace("openai/", "", 1),
+        messages=[
+            {
+                "role": "system",
+                "content": "Tu es un assistant QA documentaire. Réponds uniquement à partir du contexte fourni.",
+            },
+            {
+                "role": "user",
+                "content": f"Contexte PageIndex:\n\n{context}\n\nQuestion:\n{question}",
+            },
+        ],
+        temperature=0.1,
+        max_tokens=800,
+    )
+    return str(response.choices[0].message.content or "").strip()
 
 def get_pageindex_client(
     *,
@@ -869,7 +919,30 @@ with col_right:
                         st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
                 except Exception as exc:
                     answer = ""
-                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_capability_gap_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
+                    if is_internal_server_error(exc):
+                        try:
+                            answer = run_chat_completions_fallback(
+                                question=question,
+                                documents=st.session_state.documents,
+                                llm_api_key=llm_api_key,
+                                llm_base_url=llm_base_url,
+                                model=pageindex_model or pageindex_retrieve_model,
+                            )
+                            if answer:
+                                placeholder.markdown(answer)
+                                st.warning("Fallback activé: réponse générée via chat.completions (non-agentique).")
+                        except Exception as fallback_exc:
+                            st.error(
+                                f"Erreur PageIndex : {sanitize_error_text(exc)}"
+                                f"{build_openai_compatibility_hint(exc)}"
+                                f"{build_capability_gap_hint(exc)}"
+                                f"{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', '')))}"
+                                f"{build_endpoint_diagnostic()}"
+                                f"{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}"
+                                f" Fallback chat.completions échoué: {sanitize_error_text(fallback_exc)}"
+                            )
+                    else:
+                        st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_capability_gap_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', '')))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
 
             st.session_state.last_traces = traces
             if answer.strip():
