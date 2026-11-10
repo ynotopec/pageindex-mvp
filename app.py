@@ -30,6 +30,8 @@ from typing import Any, Callable, Dict, List, Optional
 os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
 from agents import set_tracing_disabled
+from openai import OpenAI
+from PyPDF2 import PdfReader
 import streamlit as st
 from pageindex import PageIndexClient  # type: ignore
 from pageindex.config import IndexConfig  # type: ignore
@@ -121,6 +123,95 @@ def pageindex_query_result_to_text(result: Any) -> str:
     return pageindex_value_to_text(result).strip()
 
 
+def is_pageindex_processing_failure(exc: BaseException) -> bool:
+    """Detect PageIndex's generic local PDF tree-building failure."""
+    return "processing failed" in sanitize_error_text(exc).lower()
+
+
+def build_pageindex_indexing_error_message(
+    *,
+    stored_path: Path,
+    error: BaseException,
+    retried_without_toc_detection: bool = False,
+    retry_error: Optional[BaseException] = None,
+) -> str:
+    """Build an actionable, sanitized message for PageIndex indexing failures."""
+    detail = sanitize_error_text(error)
+    message = f"Failed to index {stored_path}: {detail}"
+    if retry_error is not None:
+        message += f" Retry toc_check_page_num=0: {sanitize_error_text(retry_error)}"
+
+    retry_failed_processing = (
+        retry_error is not None and is_pageindex_processing_failure(retry_error)
+    )
+    if is_pageindex_processing_failure(error) or retry_failed_processing:
+        if retried_without_toc_detection:
+            message += (
+                " PageIndex a aussi échoué après un retry automatique avec "
+                "toc_check_page_num=0. Vérifie que le PDF contient du texte sélectionnable "
+                "(pas uniquement des scans/images), utilise un modèle d'indexation plus fiable "
+                "ou convertis/OCR le document avant de le réimporter."
+            )
+        else:
+            message += (
+                " PageIndex signale souvent cette erreur quand la table des matières du PDF "
+                "est mal détectée ou mal alignée avec les pages. En mode local, réessaie avec "
+                "toc_check_page_num=0 dans IndexConfig pour forcer l'extraction sans TOC."
+            )
+    return message
+
+
+def is_internal_server_error(exc: BaseException) -> bool:
+    """Detect generic 5xx message surfaced by OpenAI-compatible backends."""
+    return "internal server error" in sanitize_error_text(exc).lower()
+
+
+
+
+def is_litellm_model_group_error(exc: BaseException) -> bool:
+    """Detect LiteLLM proxy routing errors about missing model groups."""
+    text = sanitize_error_text(exc).lower()
+    return "model group" in text and ("available model group fallbacks" in text or "received model group" in text)
+
+
+
+def build_capability_gap_hint(exc: BaseException) -> str:
+    """Explain why chat.completions can work while agentic Responses calls fail."""
+    if not is_internal_server_error(exc):
+        return ""
+    return (
+        " Différence importante: un test réussi via chat.completions ne garantit pas "
+        "la compatibilité PageIndex. Cette app utilise openai-agents avec Responses API "
+        "+ tool calling; un backend peut répondre OK en chat.completions mais échouer en "
+        "Responses/tools."
+    )
+
+
+def build_openai_compatibility_hint(exc: BaseException) -> str:
+    """Explain the backend capability expected by PageIndex/OpenAI Agents."""
+    if not is_internal_server_error(exc):
+        return ""
+    message = (
+        " Le backend ciblé par OPENAI_BASE_URL doit être pleinement compatible "
+        "OpenAI Responses + tool calling (utilisés par openai-agents/PageIndex). "
+        "Certains endpoints OpenAI-compatibles partiels (chat/completions only) "
+        "répondent 500 sur ces appels. Les modèles open source restent compatibles "
+        "si tu passes par un serveur/proxy qui expose correctement Responses API + "
+        "tool calls (ex. LiteLLM, vLLM récent, Ollama OpenAI mode selon version). "
+        "Pour isoler le problème, vérifie d'abord avec OPENAI officiel "
+        "(https://api.openai.com/v1)."
+    )
+    if is_litellm_model_group_error(exc):
+        message += (
+            " Avec LiteLLM proxy, l'erreur 'Received Model Group=...' indique souvent "
+            "que ce model group n'est pas routé dans la config (ou sans fallback). "
+            "Ajoute un mapping pour ce group (ex. ai-tools) vers un modèle/provider "
+            "valide, ou aligne PAGEINDEX_MODEL/PAGEINDEX_RETRIEVE_MODEL sur un model "
+            "group existant côté proxy."
+        )
+    return message
+
+
 def build_pageindex_error_message(*, stream_error: BaseException, retry_error: Optional[BaseException] = None) -> str:
     message = "Le streaming PageIndex a échoué."
     message += f" Détail streaming: {sanitize_error_text(stream_error)}"
@@ -132,6 +223,11 @@ def build_pageindex_error_message(*, stream_error: BaseException, retry_error: O
         "préfixé litellm/provider/... (ex. litellm/openai/..., litellm/ollama_chat/..., "
         "litellm/vllm/...)."
     )
+    message += build_openai_compatibility_hint(stream_error)
+    message += build_capability_gap_hint(stream_error)
+    if retry_error is not None:
+        message += build_openai_compatibility_hint(retry_error)
+        message += build_capability_gap_hint(retry_error)
     return message
 
 
@@ -144,7 +240,7 @@ def normalize_retrieve_model_name(model: str) -> str:
     preserved, and other provider paths are routed through the Agents SDK
     LiteLLM provider.
     """
-    value = model.strip()
+    value = normalize_env_text(model)
     passthrough_prefixes = ("litellm/", "openai/")
     if not value or "/" not in value or value.startswith(passthrough_prefixes):
         return value
@@ -166,6 +262,16 @@ def build_pageindex_query_prompt(question: str) -> str:
     )
 
 
+
+
+def normalize_env_text(value: str) -> str:
+    """Trim whitespace and unwrap matching single/double quotes."""
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1].strip()
+    return text
+
+
 def configure_llm_environment(
     *,
     llm_api_key: str,
@@ -180,21 +286,134 @@ def configure_llm_environment(
     SDK-compatible providers all receive the same base URL.
     """
     updates: Dict[str, str] = {}
-    api_key = llm_api_key.strip()
-    base_url = llm_base_url.strip().rstrip("/")
+    api_key = normalize_env_text(llm_api_key)
+    base_url = normalize_env_text(llm_base_url).rstrip("/")
 
     updates["OPENAI_AGENTS_DISABLE_TRACING"] = "1" if disable_tracing else "0"
 
     if api_key:
         updates["OPENAI_API_KEY"] = api_key
+    else:
+        os.environ.pop("OPENAI_API_KEY", None)
+
     if base_url:
         updates["OPENAI_BASE_URL"] = base_url
         updates["OPENAI_API_BASE"] = base_url
+    else:
+        os.environ.pop("OPENAI_BASE_URL", None)
+        os.environ.pop("OPENAI_API_BASE", None)
 
     os.environ.update(updates)
     set_tracing_disabled(disable_tracing)
     return updates
 
+
+
+
+
+
+def build_model_diagnostic(*, index_model: str, retrieve_model: str) -> str:
+    """Return non-secret runtime model diagnostics for troubleshooting."""
+    left = index_model.strip()
+    right = retrieve_model.strip()
+    if not left and not right:
+        return ""
+    return f" Modèles actifs: index={left or '[default]'}, retrieve={right or '[default]'}"
+
+
+def build_backend_verdict_hint(exc: BaseException, *, endpoint: str) -> str:
+    """Provide explicit verdict text when backend appears incompatible."""
+    if not is_internal_server_error(exc):
+        return ""
+    if "api.openai.com/v1" in endpoint:
+        return ""
+    return (
+        " Verdict runtime: backend non compatible avec ce flux agentique "
+        "(Responses+tools) dans la configuration actuelle. "
+        "Si OpenAI officiel fonctionne avec les mêmes documents/questions, "
+        "le blocage vient du backend local/proxy actuel (ex. SGLang direct)."
+    )
+
+def build_endpoint_diagnostic() -> str:
+    """Return non-secret runtime endpoint diagnostics for troubleshooting."""
+    base_url = (os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or "").strip()
+    if not base_url:
+        return ""
+    return f" Endpoint actif: {base_url}"
+
+
+
+
+def extract_document_text_for_fallback(path: str, max_chars: int = 30000) -> str:
+    """Extract plain text from stored markdown/pdf document for QA fallback."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return ""
+
+    suffix = file_path.suffix.lower()
+    if suffix in {".md", ".markdown", ".txt"}:
+        return file_path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+
+    if suffix == ".pdf":
+        pages: List[str] = []
+        reader = PdfReader(str(file_path))
+        for page in reader.pages:
+            pages.append((page.extract_text() or "").strip())
+            if sum(len(p) for p in pages) >= max_chars:
+                break
+        return "\n\n".join(pages)[:max_chars]
+
+    return ""
+
+
+def run_chat_completions_fallback(
+    *,
+    question: str,
+    documents: List[dict],
+    llm_api_key: str,
+    llm_base_url: str,
+    model: str,
+) -> str:
+    """Fallback QA using plain chat.completions with indexed metadata context."""
+    api_key = normalize_env_text(llm_api_key or os.getenv("OPENAI_API_KEY", ""))
+    base_url = normalize_env_text(llm_base_url or os.getenv("OPENAI_BASE_URL", "")).rstrip("/")
+    model_name = normalize_env_text(model)
+    if not api_key or not base_url or not model_name:
+        raise RuntimeError("Fallback chat.completions indisponible: OPENAI_API_KEY, OPENAI_BASE_URL et PAGEINDEX_MODEL sont requis.")
+
+    context_parts: List[dict] = []
+    for doc in documents:
+        extracted = extract_document_text_for_fallback(str(doc.get("path") or ""), max_chars=30000)
+        context_parts.append(
+            {
+                "name": doc.get("name"),
+                "doc_id": doc.get("doc_id"),
+                "metadata": doc.get("metadata"),
+                "extracted_text": extracted,
+            }
+        )
+
+    context = json.dumps(context_parts, ensure_ascii=False, indent=2)
+    if len(context) > 80_000:
+        context = context[:80_000] + "\n...[CONTEXTE TRONQUÉ]..."
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    response = client.chat.completions.create(
+        model=model_name.replace("openai/", "", 1),
+        messages=[
+            {
+                "role": "system",
+                "content": "Tu es un assistant QA documentaire. Réponds uniquement à partir du contexte fourni.",
+            },
+            {
+                "role": "user",
+                "content": f"Contexte PageIndex:\n\n{context}\n\nQuestion:\n{question}",
+            },
+        ],
+        temperature=0.1,
+        max_tokens=800,
+    )
+    return str(response.choices[0].message.content or "").strip()
 
 def get_pageindex_client(
     *,
@@ -221,9 +440,9 @@ def get_pageindex_client(
         if index_config is not None:
             kwargs["index_config"] = index_config
         if model:
-            kwargs["model"] = model.strip()
+            kwargs["model"] = normalize_env_text(model)
         if retrieve_model:
-            kwargs["retrieve_model"] = normalize_retrieve_model_name(retrieve_model)
+            kwargs["retrieve_model"] = normalize_retrieve_model_name(normalize_env_text(retrieve_model))
     return PageIndexClient(**kwargs)
 
 
@@ -250,6 +469,19 @@ def build_index_config(
         if_add_node_summary=if_add_node_summary,
         if_add_doc_description=if_add_doc_description,
         if_add_node_text=if_add_node_text,
+    )
+
+
+def build_no_toc_retry_index_config(index_config: IndexConfig) -> IndexConfig:
+    """Copy the active local IndexConfig but disable TOC detection for one retry."""
+    return build_index_config(
+        toc_check_page_num=0,
+        max_page_num_each_node=int(index_config.max_page_num_each_node),
+        max_token_num_each_node=int(index_config.max_token_num_each_node),
+        if_add_node_id=bool(index_config.if_add_node_id),
+        if_add_node_summary=bool(index_config.if_add_node_summary),
+        if_add_doc_description=bool(index_config.if_add_doc_description),
+        if_add_node_text=bool(index_config.if_add_node_text),
     )
 
 
@@ -417,6 +649,15 @@ with st.sidebar:
     storage_path_text = st.text_input("Storage local", value=str(workspace))
 
     st.subheader("LLM local / OpenAI-compatible")
+    st.caption(
+        "Oui, les modèles open source peuvent fonctionner, mais l'endpoint doit "
+        "supporter OpenAI Responses API + tool calling (requis par PageIndex/openai-agents)."
+    )
+    st.caption(
+        "Un test positif en chat.completions seul n'est pas suffisant: PageIndex agentique "
+        "utilise Responses + tools."
+    )
+    st.caption("Syntaxe .env: évite les guillemets inutiles; en cas de doute, l'app retire automatiquement les quotes externes.")
     llm_api_key = st.text_input(
         "OPENAI_API_KEY",
         value=default_llm_api_key,
@@ -562,8 +803,53 @@ with col_left:
                     for file in uploaded_files:
                         data = file.read()
                         stored_path = write_uploaded_document(storage_path, file.name, data)
-                        doc_id = index_with_pageindex(pageindex_collection, stored_path)
-                        metadata = pageindex_collection.get_document(doc_id)
+                        active_collection = pageindex_collection
+                        try:
+                            doc_id = index_with_pageindex(active_collection, stored_path)
+                        except Exception as index_exc:
+                            can_retry_without_toc = (
+                                not pageindex_api_key
+                                and is_pageindex_processing_failure(index_exc)
+                                and int(local_index_config.toc_check_page_num) != 0
+                            )
+                            if not can_retry_without_toc:
+                                raise RuntimeError(
+                                    build_pageindex_indexing_error_message(
+                                        stored_path=stored_path,
+                                        error=index_exc,
+                                    )
+                                ) from index_exc
+
+                            st.warning(
+                                f"{file.name}: PageIndex a renvoyé 'Processing failed'. "
+                                "Retry automatique avec toc_check_page_num=0 "
+                                "(détection TOC désactivée)."
+                            )
+                            retry_config = build_no_toc_retry_index_config(local_index_config)
+                            retry_client = get_pageindex_client(
+                                api_key=pageindex_api_key,
+                                model=pageindex_model,
+                                retrieve_model=pageindex_retrieve_model,
+                                storage_path=storage_path,
+                                llm_api_key=llm_api_key,
+                                llm_base_url=llm_base_url,
+                                disable_tracing=disable_tracing,
+                                index_config=retry_config,
+                            )
+                            active_collection = get_pageindex_collection(retry_client, collection_name)
+                            try:
+                                doc_id = index_with_pageindex(active_collection, stored_path)
+                            except Exception as retry_exc:
+                                raise RuntimeError(
+                                    build_pageindex_indexing_error_message(
+                                        stored_path=stored_path,
+                                        error=index_exc,
+                                        retried_without_toc_detection=True,
+                                        retry_error=retry_exc,
+                                    )
+                                ) from retry_exc
+
+                        metadata = active_collection.get_document(doc_id)
                         docs.append(
                             {
                                 "name": file.name,
@@ -574,7 +860,7 @@ with col_left:
                             }
                         )
                 except Exception as exc:
-                    st.error(f"Indexation PageIndex impossible : {exc}")
+                    st.error(f"Indexation PageIndex impossible : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_capability_gap_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', "")))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
                     docs = []
 
             if docs:
@@ -659,7 +945,30 @@ with col_right:
                         st.warning("Le streaming PageIndex a échoué; une réponse non-streaming PageIndex a été utilisée.")
                 except Exception as exc:
                     answer = ""
-                    st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}")
+                    if is_internal_server_error(exc):
+                        try:
+                            answer = run_chat_completions_fallback(
+                                question=question,
+                                documents=st.session_state.documents,
+                                llm_api_key=llm_api_key,
+                                llm_base_url=llm_base_url,
+                                model=pageindex_model or pageindex_retrieve_model,
+                            )
+                            if answer:
+                                placeholder.markdown(answer)
+                                st.warning("Fallback activé: réponse générée via chat.completions (non-agentique).")
+                        except Exception as fallback_exc:
+                            st.error(
+                                f"Erreur PageIndex : {sanitize_error_text(exc)}"
+                                f"{build_openai_compatibility_hint(exc)}"
+                                f"{build_capability_gap_hint(exc)}"
+                                f"{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', '')))}"
+                                f"{build_endpoint_diagnostic()}"
+                                f"{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}"
+                                f" Fallback chat.completions échoué: {sanitize_error_text(fallback_exc)}"
+                            )
+                    else:
+                        st.error(f"Erreur PageIndex : {sanitize_error_text(exc)}{build_openai_compatibility_hint(exc)}{build_capability_gap_hint(exc)}{build_backend_verdict_hint(exc, endpoint=(llm_base_url or os.getenv('OPENAI_BASE_URL', '')))}{build_endpoint_diagnostic()}{build_model_diagnostic(index_model=pageindex_model, retrieve_model=pageindex_retrieve_model)}")
 
             st.session_state.last_traces = traces
             if answer.strip():

@@ -13,10 +13,21 @@ HELPER_NAMES = {
     "compact_text",
     "_doc_name_from_metadata",
     "_doc_id_from_metadata",
+    "normalize_env_text",
     "configure_llm_environment",
+    "build_endpoint_diagnostic",
+    "build_model_diagnostic",
+    "build_backend_verdict_hint",
     "sanitize_error_text",
     "pageindex_query_result_to_text",
     "build_pageindex_error_message",
+    "is_internal_server_error",
+    "build_openai_compatibility_hint",
+    "build_capability_gap_hint",
+    "is_litellm_model_group_error",
+    "is_pageindex_processing_failure",
+    "build_pageindex_indexing_error_message",
+    "build_no_toc_retry_index_config",
     "run_pageindex_query_non_stream",
     "normalize_retrieve_model_name",
     "build_pageindex_query_prompt",
@@ -100,6 +111,14 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertEqual(text, "abc\n... [sortie tronquée]")
 
+    def test_normalize_env_text_unwraps_outer_quotes(self):
+        helpers = load_helpers()
+
+        self.assertEqual(helpers["normalize_env_text"](" 'abc' "), "abc")
+        self.assertEqual(helpers["normalize_env_text"](' "abc" '), "abc")
+        self.assertEqual(helpers["normalize_env_text"]("a'b"), "a'b")
+
+
     def test_configure_llm_environment_sets_base_url_aliases(self):
         helpers = load_helpers()
         original = {
@@ -131,6 +150,30 @@ class PageIndexHelperTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_configure_llm_environment_accepts_quoted_values(self):
+        helpers = load_helpers()
+        original = {
+            key: os.environ.get(key)
+            for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+        }
+        try:
+            helpers["configure_llm_environment"](
+                llm_api_key="'sk-quoted'",
+                llm_base_url='"http://localhost:8000/v1/"',
+                disable_tracing=True,
+            )
+
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-quoted")
+            self.assertEqual(os.environ["OPENAI_BASE_URL"], "http://localhost:8000/v1")
+            self.assertEqual(os.environ["OPENAI_API_BASE"], "http://localhost:8000/v1")
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
     def test_configure_llm_environment_can_enable_tracing(self):
         helpers = load_helpers()
         original = os.environ.get("OPENAI_AGENTS_DISABLE_TRACING")
@@ -148,6 +191,76 @@ class PageIndexHelperTests(unittest.TestCase):
                 os.environ.pop("OPENAI_AGENTS_DISABLE_TRACING", None)
             else:
                 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = original
+
+    def test_configure_llm_environment_clears_previous_endpoint_and_key_when_empty(self):
+        helpers = load_helpers()
+        original = {
+            key: os.environ.get(key)
+            for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+        }
+        try:
+            os.environ["OPENAI_API_KEY"] = "sk-old"
+            os.environ["OPENAI_BASE_URL"] = "http://old/v1"
+            os.environ["OPENAI_API_BASE"] = "http://old/v1"
+
+            helpers["configure_llm_environment"](
+                llm_api_key="",
+                llm_base_url="",
+                disable_tracing=True,
+            )
+
+            self.assertNotIn("OPENAI_API_KEY", os.environ)
+            self.assertNotIn("OPENAI_BASE_URL", os.environ)
+            self.assertNotIn("OPENAI_API_BASE", os.environ)
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_build_endpoint_diagnostic_includes_active_base_url(self):
+        helpers = load_helpers()
+        original = {
+            key: os.environ.get(key)
+            for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE")
+        }
+        try:
+            os.environ["OPENAI_BASE_URL"] = "http://sglang:30000/v1"
+            text = helpers["build_endpoint_diagnostic"]()
+
+            self.assertIn("Endpoint actif", text)
+            self.assertIn("sglang", text)
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+    def test_build_model_diagnostic_includes_active_models(self):
+        helpers = load_helpers()
+
+        text = helpers["build_model_diagnostic"](
+            index_model="qwen3.6",
+            retrieve_model="qwen3.6",
+        )
+
+        self.assertIn("qwen3.6", text)
+        self.assertIn("index=", text)
+
+    def test_backend_verdict_hint_flags_non_openai_500(self):
+        helpers = load_helpers()
+
+        text = helpers["build_backend_verdict_hint"](
+            RuntimeError("Internal Server Error"),
+            endpoint="http://10.0.1.1:8572/v1",
+        )
+
+        self.assertIn("Verdict runtime", text)
+        self.assertIn("non compatible", text)
+
 
     def test_sanitize_error_text_redacts_api_keys(self):
         helpers = load_helpers()
@@ -169,6 +282,80 @@ class PageIndexHelperTests(unittest.TestCase):
 
         self.assertIn("OPENAI_BASE_URL", text)
         self.assertIn("Provider List", text)
+
+    def test_openai_compatibility_hint_detects_internal_server_error(self):
+        helpers = load_helpers()
+
+        exc = RuntimeError("Internal Server Error")
+        hint = helpers["build_openai_compatibility_hint"](exc)
+
+        self.assertTrue(helpers["is_internal_server_error"](exc))
+        self.assertIn("Responses", hint)
+        self.assertIn("tool", hint)
+
+    def test_build_pageindex_error_message_includes_compatibility_hint_on_500(self):
+        helpers = load_helpers()
+
+        text = helpers["build_pageindex_error_message"](stream_error=RuntimeError("Internal Server Error"))
+
+        self.assertIn("OpenAI Responses", text)
+        self.assertIn("OPENAI_BASE_URL", text)
+
+
+    def test_capability_gap_hint_mentions_chat_completions_vs_responses(self):
+        helpers = load_helpers()
+
+        text = helpers["build_capability_gap_hint"](RuntimeError("Internal Server Error"))
+
+        self.assertIn("chat.completions", text)
+        self.assertIn("Responses", text)
+
+
+    def test_litellm_model_group_error_gets_specific_hint(self):
+        helpers = load_helpers()
+
+        exc = RuntimeError("Received Model Group=ai-tools Available Model Group Fallbacks=None Internal Server Error")
+        hint = helpers["build_openai_compatibility_hint"](exc)
+
+        self.assertTrue(helpers["is_litellm_model_group_error"](exc))
+        self.assertIn("ai-tools", hint)
+        self.assertIn("model group", hint.lower())
+
+
+    def test_processing_failed_indexing_message_recommends_no_toc_retry(self):
+        helpers = load_helpers()
+
+        error = RuntimeError("Failed to index /tmp/report.pdf: Processing failed")
+        text = helpers["build_pageindex_indexing_error_message"](
+            stored_path=Path("/tmp/report.pdf"),
+            error=error,
+        )
+
+        self.assertTrue(helpers["is_pageindex_processing_failure"](error))
+        self.assertIn("toc_check_page_num=0", text)
+        self.assertIn("sans TOC", text)
+
+    def test_retry_index_config_only_disables_toc_detection(self):
+        helpers = load_helpers()
+
+        config = helpers["build_index_config"](
+            toc_check_page_num=20,
+            max_page_num_each_node=8,
+            max_token_num_each_node=12000,
+            if_add_node_id=True,
+            if_add_node_summary=False,
+            if_add_doc_description=True,
+            if_add_node_text=False,
+        )
+        retry_config = helpers["build_no_toc_retry_index_config"](config)
+
+        self.assertEqual(retry_config.toc_check_page_num, 0)
+        self.assertEqual(retry_config.max_page_num_each_node, 8)
+        self.assertEqual(retry_config.max_token_num_each_node, 12000)
+        self.assertTrue(retry_config.if_add_node_id)
+        self.assertFalse(retry_config.if_add_node_summary)
+        self.assertTrue(retry_config.if_add_doc_description)
+        self.assertFalse(retry_config.if_add_node_text)
 
     def test_non_stream_query_helper_requires_no_running_loop(self):
         helpers = load_helpers()
